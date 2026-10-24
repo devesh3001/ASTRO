@@ -54,18 +54,25 @@ class OpenAIClient:
 
     def complete(self, messages, tools, timeout):
         import time
-        kwargs = dict(model=self.model, messages=messages, tools=tools, timeout=timeout)
+        t_start = time.monotonic()
+        kwargs = dict(model=self.model, messages=messages, tools=tools)
         if self.max_tokens:
             kwargs["max_tokens"] = self.max_tokens      # optional: set MAX_TOKENS to cap each reply
         max_retries = 3
         for attempt in range(max_retries):
+            elapsed = time.monotonic() - t_start
+            rem_timeout = timeout - elapsed
+            if rem_timeout <= 2.0:
+                raise TimeoutError("Episode deadline reached before completing request")
+            kwargs["timeout"] = min(rem_timeout, 45.0)
             try:
                 response = self.client.chat.completions.create(**kwargs)
                 break
             except Exception as exc:
                 err_str = str(exc)
-                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower()) and attempt < max_retries - 1:
-                    time.sleep(14)
+                time_left = timeout - (time.monotonic() - t_start)
+                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower()) and attempt < max_retries - 1 and time_left > 15.0:
+                    time.sleep(min(12.0, time_left - 3.0))
                     continue
                 raise
         message = response.choices[0].message

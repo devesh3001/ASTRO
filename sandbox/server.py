@@ -1,9 +1,9 @@
 """Hardened Sandbox service: runs the agent's tools inside an isolated workspace.
 
-Security & Isolation:
-1. Sits on an internal Docker network with NO internet access.
+Security & Isolation Architecture:
+1. Internal Network Isolation: Sits on an isolated Docker network with NO internet access.
 2. Separate Execution Identities:
-   - Server runs with privilege separation.
+   - Server runs with least required capabilities (`cap_drop: [ALL]`).
    - Agent tool execution (run_python) executes strictly as unprivileged user
      `sandbox-agent` (UID 1001), isolated from the server process.
 3. Cryptographically Secure Dynamic Secret:
@@ -11,11 +11,15 @@ Security & Isolation:
      a root-owned, mode 0600 file (/run/aerosentinel/harness_secret.txt).
    - The token is NEVER visible in docker-compose.yml or to the agent process.
 4. Protected Endpoints:
-   - /reset, /state, /fetch_configs strictly require X-Harness-Secret header.
+   - /reset, /state, /fetch_configs, /eval_script, /sync_telemetry require X-Harness-Secret header.
    - Unauthenticated calls receive 403 Forbidden.
-5. Interactive Orbit Progression:
-   - Tool `step_orbit` advances the satellite orbit and logs dynamic telemetry.
-   - Evaluation runs exclusively in the harness container (zero grading code here).
+5. Path Traversal & Symlink Hardening:
+   - All paths strictly resolve inside /workspace; system directories (/proc, /sys, /etc, /run)
+     and directory escapes are blocked.
+6. Isolated Evaluation Worker:
+   - The verifier executes untrusted agent scripts via /eval_script inside an ephemeral,
+     unprivileged directory as sandbox-agent (UID 1001).
+   - Untrusted code NEVER executes inside the harness container.
 """
 import configparser
 import hashlib
@@ -60,18 +64,29 @@ if not _AUTH_TOKEN:
     try:
         SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
         SECRET_FILE.write_text(_AUTH_TOKEN, encoding="utf-8")
-        # Restrict permissions to owner only (chmod 600)
         os.chmod(SECRET_FILE, 0o600)
     except Exception:
         pass
 
 
 def safe_path(relative: str) -> Path:
-    """Ensure path stays strictly within the workspace directory."""
-    path = (WORKSPACE / relative).resolve()
-    if path != WORKSPACE and WORKSPACE not in path.parents:
-        raise ValueError("path traversal blocked: path must stay inside workspace")
-    return path
+    """Ensure path stays strictly within the workspace directory, preventing directory traversal and symlink escapes."""
+    rel = str(relative).replace("\\", "/").strip()
+    if rel.startswith("/") or ".." in rel.split("/"):
+        raise ValueError("path traversal blocked: relative path must not contain '..' or leading '/'")
+
+    target = (WORKSPACE / rel).resolve()
+    try:
+        target.relative_to(WORKSPACE)
+    except ValueError:
+        raise ValueError(f"path traversal blocked: path '{relative}' resolves outside workspace")
+
+    # Block access to system paths or private runtime directories
+    for blocked in ("/run", "/proc", "/sys", "/etc", "/dev", "/root", "/var"):
+        if str(target).startswith(blocked):
+            raise ValueError(f"access to system directory '{blocked}' is strictly forbidden")
+
+    return target
 
 
 def clip(text: str) -> str:
@@ -86,23 +101,7 @@ def all_files(root: Path):
             yield path
 
 
-# ---- Interactive Orbital Progression State ---------------------------
-_ORBIT_STATE = {
-    "elapsed_min": 0,
-    "soc_wh": 28.0,
-    "temp_c": 14.0,
-    "pointing_err": 35.0,
-}
-
-
 def _init_orbit_state():
-    global _ORBIT_STATE
-    _ORBIT_STATE = {
-        "elapsed_min": 0,
-        "soc_wh": 28.0,
-        "temp_c": 14.0,
-        "pointing_err": 35.0,
-    }
     telemetry_dir = WORKSPACE / "telemetry"
     telemetry_dir.mkdir(parents=True, exist_ok=True)
 
@@ -120,10 +119,9 @@ def _init_orbit_state():
     status_file.write_text(json.dumps(status_data, indent=2), encoding="utf-8")
 
     log_file = telemetry_dir / "live_telemetry.csv"
-    if not log_file.is_file():
-        header = "elapsed_min,orbit_phase,bus_v,soc_pct,temp_c,pointing_err_deg,link_margin_db,heater\n"
-        init_row = "0,SUNLIGHT,3.70,70.0,14.0,35.0,-6.0,OFF\n"
-        log_file.write_text(header + init_row, encoding="utf-8")
+    header = "elapsed_min,orbit_phase,bus_v,soc_pct,temp_c,pointing_err_deg,link_margin_db,heater\n"
+    init_row = "0,SUNLIGHT,3.70,70.0,14.0,35.0,-6.0,OFF\n"
+    log_file.write_text(header + init_row, encoding="utf-8")
 
 
 # ----------------------------------------------------------------------------
@@ -150,138 +148,20 @@ def tool_write_file(args):
 
 
 def tool_step_orbit(args):
-    """Advance the orbital simulation by the specified minutes (1-30)."""
-    global _ORBIT_STATE
-    try:
-        minutes = int(args.get("minutes", 10))
-    except (ValueError, TypeError):
-        minutes = 10
-    minutes = max(1, min(30, minutes))
-
-    eps_cfg = configparser.ConfigParser()
-    p_eps = WORKSPACE / "subsystems" / "eps.cfg"
-    if not p_eps.is_file():
-        p_eps = WORKSPACE / "eps.cfg"
-    if p_eps.is_file():
-        eps_cfg.read(str(p_eps))
-
-    adcs_cfg = configparser.ConfigParser()
-    p_adcs = WORKSPACE / "subsystems" / "adcs.cfg"
-    if not p_adcs.is_file():
-        p_adcs = WORKSPACE / "adcs.cfg"
-    if p_adcs.is_file():
-        adcs_cfg.read(str(p_adcs))
-
-    thermal_cfg = configparser.ConfigParser()
-    p_thm = WORKSPACE / "subsystems" / "thermal.cfg"
-    if not p_thm.is_file():
-        p_thm = WORKSPACE / "thermal.cfg"
-    if p_thm.is_file():
-        thermal_cfg.read(str(p_thm))
-
-    comms_cfg = configparser.ConfigParser()
-    p_com = WORKSPACE / "subsystems" / "comms.cfg"
-    if not p_com.is_file():
-        p_com = WORKSPACE / "comms.cfg"
-    if p_com.is_file():
-        comms_cfg.read(str(p_com))
-
-    def _get(cfg, sec, k, d):
+    """Fallback status check if called directly on sandbox."""
+    status_file = WORKSPACE / "telemetry" / "current_status.json"
+    if status_file.is_file():
         try:
-            return float(cfg[sec][k])
+            data = json.loads(status_file.read_text(encoding="utf-8"))
+            return (
+                f"Orbit Status (MET: {data.get('elapsed_minutes')} min, Phase: {data.get('orbit_phase')}):\n"
+                f"Bus Voltage={data.get('bus_voltage_v')}V, Battery SoC={data.get('battery_soc_pct')}%, "
+                f"Temp={data.get('battery_temp_c')}°C, Pointing Err={data.get('pointing_error_deg')}°, "
+                f"Link Margin={data.get('link_margin_db')} dB (Heater: {'ON' if data.get('heater_active') else 'OFF'})."
+            )
         except Exception:
-            return d
-
-    solar_eff = _get(eps_cfg, "power", "solar_efficiency", 0.41)
-    uv_thresh = _get(eps_cfg, "power", "undervoltage_threshold", 2.80)
-    wheel_bias = _get(adcs_cfg, "attitude", "wheel_bias_rpm", 120.0)
-    deadband = _get(adcs_cfg, "attitude", "pointing_deadband_deg", 0.50)
-    gain = _get(adcs_cfg, "attitude", "control_gain", 0.40)
-    heater_sp = _get(thermal_cfg, "thermal", "battery_heater_setpoint", 65.0)
-    heater_hyst = _get(thermal_cfg, "thermal", "heater_hysteresis_c", 2.0)
-    thermal_cut = _get(thermal_cfg, "thermal", "thermal_cutoff_temp", 35.0)
-    tx_p = _get(comms_cfg, "comms", "tx_power_dbm", 20.0)
-    ant_g = _get(comms_cfg, "comms", "antenna_gain_dbi", 2.0)
-    path_l = _get(comms_cfg, "comms", "path_loss_db", 141.5)
-
-    telemetry_dir = WORKSPACE / "telemetry"
-    telemetry_dir.mkdir(parents=True, exist_ok=True)
-    log_file = telemetry_dir / "live_telemetry.csv"
-
-    rows = []
-    for _ in range(minutes):
-        _ORBIT_STATE["elapsed_min"] += 1
-        t_min = _ORBIT_STATE["elapsed_min"]
-        in_eclipse = (t_min % 95) >= 60
-        phase = "ECLIPSE" if in_eclipse else "SUNLIGHT"
-
-        # ADCS attitude dynamics
-        if abs(wheel_bias) > 20.0:
-            _ORBIT_STATE["pointing_err"] = min(120.0, _ORBIT_STATE["pointing_err"] + abs(wheel_bias) * 0.04)
-        else:
-            _ORBIT_STATE["pointing_err"] = max(deadband, _ORBIT_STATE["pointing_err"] * (1.0 - min(0.35, gain * 0.06)))
-
-        cos_sun = max(0.0, math.cos(math.radians(min(88.0, _ORBIT_STATE["pointing_err"]))))
-
-        # EPS solar generation & battery
-        if in_eclipse:
-            p_gen = 0.0
-        else:
-            clamped_eff = max(0.0, min(0.85, solar_eff))
-            p_gen = clamped_eff * 0.28 * 0.06 * 1361.0 * cos_sun
-
-        # TCS thermostat & load power
-        heater_on = (_ORBIT_STATE["temp_c"] < (heater_sp - heater_hyst)) and (_ORBIT_STATE["temp_c"] < thermal_cut)
-        p_load = 4.5 + (6.0 if heater_on else 0.0)
-
-        # Energy update (40 Wh capacity)
-        net_p = p_gen - p_load
-        _ORBIT_STATE["soc_wh"] = max(0.0, min(40.0, _ORBIT_STATE["soc_wh"] + net_p * (1.0 / 60.0)))
-        soc_pct = (_ORBIT_STATE["soc_wh"] / 40.0) * 100.0
-        bus_v = 3.0 + 1.2 * (soc_pct / 100.0)
-
-        # Thermal dynamics
-        q_diss = p_load * 0.8
-        q_sol = 0.0 if in_eclipse else 2.5 * cos_sun
-        q_rad = 0.09 * (_ORBIT_STATE["temp_c"] - (-35.0))
-        _ORBIT_STATE["temp_c"] += ((q_diss + q_sol - q_rad) * 60.0) / 380.0
-
-        # RF Link Margin
-        pointing_loss = min(20.0, (_ORBIT_STATE["pointing_err"] / 10.0) ** 2)
-        link_margin = (tx_p + ant_g + 16.0) - path_l - 2.5 - (-100.0) - pointing_loss
-
-        rows.append(
-            f"{t_min},{phase},{bus_v:.2f},{soc_pct:.1f},{_ORBIT_STATE['temp_c']:.1f},"
-            f"{_ORBIT_STATE['pointing_err']:.2f},{link_margin:.1f},{'ON' if heater_on else 'OFF'}\n"
-        )
-
-    try:
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.writelines(rows)
-    except Exception:
-        pass
-
-    status_data = {
-        "elapsed_minutes": _ORBIT_STATE["elapsed_min"],
-        "orbit_phase": phase,
-        "bus_voltage_v": round(bus_v, 2),
-        "battery_soc_pct": round(soc_pct, 1),
-        "battery_temp_c": round(_ORBIT_STATE["temp_c"], 1),
-        "pointing_error_deg": round(_ORBIT_STATE["pointing_err"], 2),
-        "heater_active": heater_on,
-        "link_margin_db": round(link_margin, 1),
-    }
-    try:
-        (telemetry_dir / "current_status.json").write_text(json.dumps(status_data, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-    return (
-        f"Orbit advanced by {minutes} min (MET: {_ORBIT_STATE['elapsed_min']} min, Phase: {phase}).\n"
-        f"Status: Bus={bus_v:.2f}V, Battery SoC={soc_pct:.1f}%, Temp={_ORBIT_STATE['temp_c']:.1f}°C, "
-        f"Pointing Err={_ORBIT_STATE['pointing_err']:.2f}°, Link Margin={link_margin:.1f} dB (Heater: {'ON' if heater_on else 'OFF'}).\n"
-        f"Updated logs in telemetry/live_telemetry.csv and telemetry/current_status.json"
-    )
+            pass
+    return "Orbit advanced. Check telemetry/current_status.json and telemetry/live_telemetry.csv."
 
 
 def tool_run_python(args):
@@ -346,7 +226,7 @@ def do_reset(body):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
-    # Initialize dynamic orbital telemetry state
+    # Initialize dynamic orbital telemetry files
     _init_orbit_state()
 
     # Set file ownership and permissions to sandbox-agent if on POSIX
@@ -403,10 +283,110 @@ def do_state(_body=None):
     return {"files": files}
 
 
+def do_eval_script(body):
+    """Execute an agent script in an isolated ephemeral directory as sandbox-agent (UID 1001).
+    
+    Used exclusively by the trusted harness verifier. The untrusted code never executes
+    inside the harness container.
+    """
+    script_rel = body.get("script_relpath", "scripts/link_budget.py")
+    test_cases = body.get("test_cases", [])
+    script_path = safe_path(script_rel)
+    if not script_path.is_file():
+        return {"error": f"script not found: {script_rel}", "results": []}
+
+    script_code = script_path.read_text(encoding="utf-8", errors="replace")
+    results = []
+
+    clean_env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "HOME": "/home/sandbox-agent" if Path("/home/sandbox-agent").exists() else str(WORKSPACE),
+        "USER": "sandbox-agent",
+    }
+    kwargs = {
+        "capture_output": True,
+        "text": True,
+        "timeout": 5,
+        "env": clean_env,
+    }
+    if hasattr(os, "getuid") and os.getuid() == 0:
+        try:
+            import pwd
+            agent_user = pwd.getpwnam("sandbox-agent")
+            kwargs["user"] = agent_user.pw_uid
+            kwargs["group"] = agent_user.pw_gid
+        except Exception:
+            pass
+
+    import tempfile
+    for tc in test_cases:
+        temp_dir = Path(tempfile.mkdtemp(dir=WORKSPACE, prefix=".eval_"))
+        try:
+            if hasattr(os, "getuid") and os.getuid() == 0:
+                try:
+                    import pwd
+                    agent_user = pwd.getpwnam("sandbox-agent")
+                    os.chown(temp_dir, agent_user.pw_uid, agent_user.pw_gid)
+                    os.chmod(temp_dir, 0o777)
+                except Exception:
+                    pass
+
+            (temp_dir / "scripts").mkdir(parents=True, exist_ok=True)
+            (temp_dir / "subsystems").mkdir(parents=True, exist_ok=True)
+            (temp_dir / "scripts" / "link_budget.py").write_text(script_code, encoding="utf-8")
+
+            for fname, content in tc.items():
+                p = temp_dir / fname
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(content, encoding="utf-8")
+
+            runner_code = "import sys; from scripts.link_budget import calc_margin; print(calc_margin())"
+            proc = subprocess.run([sys.executable, "-c", runner_code], cwd=temp_dir, **kwargs)
+            if proc.returncode == 0:
+                try:
+                    val = float(proc.stdout.strip())
+                    results.append(val)
+                except ValueError:
+                    results.append(None)
+            else:
+                results.append(None)
+        except Exception:
+            results.append(None)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return {"results": results}
+
+
+def do_sync_telemetry(body):
+    """Write authoritative telemetry frames and current status from harness to the workspace."""
+    telemetry_dir = WORKSPACE / "telemetry"
+    telemetry_dir.mkdir(parents=True, exist_ok=True)
+
+    status = body.get("status")
+    if status is not None:
+        (telemetry_dir / "current_status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
+
+    csv_append = body.get("csv_append")
+    if csv_append:
+        log_file = telemetry_dir / "live_telemetry.csv"
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(csv_append)
+        except Exception:
+            pass
+
+    return {"ok": True}
+
+
 ROUTES_POST = {
     "/reset": (do_reset, True),
     "/tool": (do_tool, False),
     "/fetch_configs": (do_fetch_configs, True),
+    "/eval_script": (do_eval_script, True),
+    "/sync_telemetry": (do_sync_telemetry, True),
 }
 
 

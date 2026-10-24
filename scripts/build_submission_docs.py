@@ -1,7 +1,8 @@
-"""Generates design-doc.pdf, deck.pdf, and assembles Astro.zip and Aerosentinel.zip."""
+"""Generates design-doc.pdf, deck.pdf, and assembles Astro.zip and Aerosentinel.zip with strict validation."""
 import json
 import os
 import shutil
+import sys
 import zipfile
 from pathlib import Path
 from reportlab.lib.pagesizes import letter, landscape
@@ -87,7 +88,7 @@ def build_design_doc(pdf_path: Path):
     story.append(Paragraph(
         "AeroSentinel evaluates autonomous AI agents tasked with diagnosing and remediating in-flight anomalies "
         "on a 3U CubeSat in Low Earth Orbit (500 km, 95-minute period). Unlike traditional coding sandboxes that evaluate "
-        "static string matches or unit tests visible in the repository, AeroSentinel embeds a <b>deterministic orbital multi-physics engine</b>. "
+        "static string matches or unit tests visible in the repository, AeroSentinel embeds an <b>authoritative orbital multi-physics engine</b>. "
         "The satellite's state is continuously evaluated across sunlight and eclipse cycles: solar array generation (0.06 m², GaAs triple-junction), "
         "battery Coulombic state-of-charge (40.0 Wh Li-ion, 3.10V cutoff), nonlinear bus voltage dynamics, 3-axis reaction wheel angular momentum "
         "and attitude precession, thermostat hysteresis thermal balance, and UHF 437.5 MHz Friis link budget margins with 141.5 dB free-space path loss. "
@@ -128,16 +129,15 @@ def build_design_doc(pdf_path: Path):
     story.append(Paragraph("3. Unbreakable Isolation & Security Defenses", h2_style))
     story.append(Paragraph(
         "AeroSentinel is hardened against adversarial model behaviors, sandbox escapes, and scoring manipulation: "
-        "<br/>• <b>Isolated Physics Verifier</b>: Evaluation code and ground-truth physics run strictly inside the harness container. "
-        "The sandbox container has zero verification code, zero answer keys, and zero scoring logic. "
-        "<br/>• <b>Privilege Separation & Unprivileged Execution</b>: Tool commands (<code>run_python</code>) execute strictly under unprivileged "
-        "account <code>sandbox-agent</code> (UID 1001). Server process secrets and <code>/proc/1/environ</code> are inaccessible. "
-        "<br/>• <b>Dynamic Secret Token Authorization</b>: Privileged endpoints (<code>/reset</code>, <code>/state</code>, <code>/fetch_configs</code>) "
-        "require a dynamically generated 256-bit token stored in mode 0600 root volume (<code>/run/aerosentinel</code>). Unauthenticated calls receive <code>403 Forbidden</code>. "
-        "<br/>• <b>Dynamic Behavioural Verification</b>: Python scripts (e.g. <code>link_budget.py</code>) undergo automated behavioural execution against "
-        "synthesized dynamic test fixtures, eliminating trivial substring comment loopholes. "
-        "<br/>• <b>Interactive Orbit Stepping</b>: Tool <code>step_orbit</code> advances the satellite orbit, logging dynamic consequences to "
-        "<code>telemetry/live_telemetry.csv</code> before final verification.",
+        "<br/>• <b>Authoritative Unified State & Latched Violations</b>: Virtual time, Coulombic battery energy, and thermal equilibrium "
+        "form a single authoritative trajectory. Any irreversible catastrophic violation (bus collapse <= 3.10V, runaway > 50°C) is permanently latched. "
+        "<br/>• <b>Isolated Unprivileged Evaluation Worker</b>: Untrusted agent Python code is NEVER executed in the harness container. "
+        "Behavioral checks execute via <code>/eval_script</code> in isolated ephemeral directories under unprivileged <code>sandbox-agent</code> (UID 1001). "
+        "<br/>• <b>Dynamic Secret Token Authorization</b>: Privileged endpoints (<code>/reset</code>, <code>/state</code>, <code>/fetch_configs</code>, <code>/eval_script</code>) "
+        "require a dynamically generated 256-bit token created at container startup into a root-owned <code>mode 0600</code> volume. "
+        "<br/>• <b>Physical Channel Law Throughput</b>: Downlink byte throughput is bounded by configured baud rate (9600 bps -> max 576 kB in 8 min). "
+        "<br/>• <b>Monotonic Execution Deadlines</b>: A global monotonic clock bounds model calls, 429 retries, and tool calls, preserving a 15-second "
+        "verification buffer to ensure every run completes strictly within the 600-second contractual budget.",
         body_style
     ))
 
@@ -145,7 +145,7 @@ def build_design_doc(pdf_path: Path):
     story.append(Paragraph(
         "Scoring is entirely programmatic (zero LLM-as-judge) and evaluates physical mission success over a 95-minute orbit: "
         "<br/><code>Reward = Power_Balance (0.35) + Thermal_Stability (0.25) + ADCS_Precision (0.20) + Comms_Closure (0.20)</code> "
-        "<br/>• <b>Catastrophic Zeroing</b>: Irreversible failure (bus collapse < 3.10V, thermal runaway > 50°C, freezing < -15°C) "
+        "<br/>• <b>Catastrophic Zeroing</b>: Irreversible failure (bus collapse <= 3.10V, thermal runaway > 50°C, freezing < -15°C) "
         "strictly clamps the total reward to 0.00. "
         "<br/>• <b>Continuous Partial Credit</b>: Sustained battery SoC, settled pointing angle within deadband, and downlink packet throughput "
         "yield proportional credit for genuine engineering progress.",
@@ -156,11 +156,11 @@ def build_design_doc(pdf_path: Path):
     weakness_data = [
         [Paragraph("<b>Known Vulnerability / Threat</b>", body_style), Paragraph("<b>Architectural Defense Implemented</b>", body_style)],
         [Paragraph("Agent attempts to inspect or tamper with verifier files", body_style), Paragraph("Verifier runs entirely in the separate Harness container; sandbox filesystem has zero grading code.", body_style)],
-        [Paragraph("Agent tries to trigger reset or state manipulation", body_style), Paragraph("Endpoints require HARNESS_SECRET bearer validation; agent subprocess has no token access (403 Forbidden).", body_style)],
-        [Paragraph("Agent submits comment-only bypass for link budget", body_style), Paragraph("Dynamic behavioural verification executes calc_margin() against synthesized configs with varying path loss.", body_style)],
+        [Paragraph("Untrusted agent Python code executed in harness", body_style), Paragraph("All script evaluation runs via /eval_script inside the sandbox container under UID 1001 sandbox-agent.", body_style)],
+        [Paragraph("Agent submits comment-only bypass for link budget", body_style), Paragraph("Dynamic behavioural verification executes calc_margin() against 3 randomized test fixtures with varying path loss.", body_style)],
         [Paragraph("Agent submits infinite loops (while True: pass) or memory hogs", body_style), Paragraph("Subprocess kills calls at 20 seconds; container enforces 512MB RAM and 256 PID limits.", body_style)],
-        [Paragraph("Agent exploits path traversal (../../etc/passwd)", body_style), Paragraph("safe_path() validates path resolves strictly within /workspace, raising ValueError on escapes.", body_style)],
-        [Paragraph("Provider rate limit / context overflow crash", body_style), Paragraph("Client implements automatic 429 exponential backoff retry; context trimmer caps conversation under 48K tokens.", body_style)],
+        [Paragraph("Symlink or path traversal attack (../../etc/passwd)", body_style), Paragraph("safe_path() canonicalizes path via resolve() and checks relative_to(WORKSPACE), blocking /proc, /run, /etc.", body_style)],
+        [Paragraph("Provider rate limit / context overflow exceeds 600s", body_style), Paragraph("Monotonic deadline tracks remaining time across API calls, 429 backoff retries, and tools, reserving 15s for verifier.", body_style)],
     ]
     t2 = Table(weakness_data, colWidths=[240, 300])
     t2.setStyle(TableStyle([
@@ -202,7 +202,7 @@ def build_deck(pdf_path: Path):
                 "Presenter: Devesh Srivastava (Avionics Head, IIT BHU Rocketry Division)",
                 "Domain: Autonomous Satellite Fault Diagnosis & Flight Software Remediation",
                 "Challenge: Build an RL environment that cannot be broken, cheated, or bypassed",
-                "Key Innovation: Deterministic 95-minute orbital physics engine replacing static test suites"
+                "Key Innovation: Authoritative 95-minute orbital physics engine with unified episode state"
             ]
         },
         {
@@ -235,18 +235,18 @@ def build_deck(pdf_path: Path):
                 "Electrical Power (EPS): Solar generation (0.06 m2 GaAs, 28% eff), 40 Wh Li-ion, 3.10V cutoff",
                 "Attitude Control (ADCS): 3-axis reaction wheel momentum bias, precession rate, sun pointing",
                 "Thermal Control (TCS): Radiative cooling to 4K space, internal dissipation, thermostat hysteresis",
-                "RF Communications (COMMS): UHF 437.5 MHz Friis link budget, 141.5 dB FSPL, ground pass closure"
+                "RF Communications (COMMS): UHF 437.5 MHz Friis link budget, 141.5 dB FSPL, baud-rate bounded throughput"
             ]
         },
         {
             "num": "05",
             "title": "Unbreakable Security & Isolation Architecture",
-            "subtitle": "Zero Trust Sandbox with Privilege Separation",
+            "subtitle": "Zero Trust Sandbox with Out-of-Band Evaluation",
             "bullets": [
                 "Isolated Verifier: Verifier and orbital simulator run in Harness container only (zero sandbox access)",
-                "Privilege Separation: Untrusted code execution runs strictly under unprivileged UID 1001 sandbox-agent",
-                "Dynamic Token Auth: Privileged endpoints (/reset, /state, /fetch_configs) require dynamic 256-bit token",
-                "Dynamic Behavioural Verification: Automated script execution against dynamic test fixtures",
+                "Safe Script Evaluation: Untrusted agent Python code evaluated via unprivileged sandbox worker (UID 1001)",
+                "Dynamic Token Auth: Privileged endpoints (/reset, /state, /fetch_configs, /eval_script) require 256-bit token",
+                "Monotonic Time Limits: Hard 600-second execution deadline across model calls, 429 retries, and tools",
                 "Robust Limits: 20s tool timeouts, 4000-char clipping, 48K context window trimming"
             ]
         },
@@ -268,8 +268,8 @@ def build_deck(pdf_path: Path):
             "subtitle": "Rewarding Mission Survival and Safe Operations",
             "bullets": [
                 "Reward Formula: Power_Balance (0.35) + Thermal_Safety (0.25) + ADCS (0.20) + Comms (0.20)",
-                "Catastrophic Zeroing: Irreversible violations (bus collapse < 3.10V, temp > 50°C) award 0.00",
-                "Continuous Partial Credit: Sustained battery SoC and packet throughput reward genuine progress",
+                "Catastrophic Zeroing: Irreversible violations (bus collapse <= 3.10V, temp > 50°C) permanently zero score",
+                "Unified Trajectory: Scoring evaluates actual operational trajectory plus completed orbit",
                 "Objective & Deterministic: Programmatic telemetry evaluation — zero LLM-as-judge variance"
             ]
         },
@@ -367,58 +367,109 @@ def build_deck(pdf_path: Path):
 
 
 # ============================================================================
-# 3. DYNAMIC LOG DISCOVERY & SUBMISSION ARCHIVE ASSEMBLY
+# 3. STRICT EVIDENCE VALIDATION & ARCHIVE ASSEMBLY
 # ============================================================================
-def find_runs():
-    """Dynamically discover baseline gates and model runs from the logs directory."""
+def validate_and_find_evidence():
+    """Verify all mandatory competition evidence exists in logs/ before producing the ZIP."""
     logs_dir = ROOT / "logs"
     if not logs_dir.is_dir():
-        return None, []
+        raise RuntimeError("Mandatory evidence missing: logs/ directory does not exist.")
 
-    gate_dirs = []
-    model_runs = []
+    # 1. Check all-task baseline gate evidence
+    valid_gates = []
+    for d in sorted(logs_dir.iterdir(), key=lambda p: p.name, reverse=True):
+        if not d.is_dir():
+            continue
+        gate_path = d / "gate.json"
+        if gate_path.is_file():
+            try:
+                gdata = json.loads(gate_path.read_text(encoding="utf-8"))
+                tasks = gdata.get("tasks", [])
+                if gdata.get("passed") is True and len(tasks) == 5:
+                    if all(t.get("oracle_ok") and t.get("noop_ok") for t in tasks):
+                        valid_gates.append(d)
+            except Exception:
+                pass
+
+    if not valid_gates:
+        raise RuntimeError(
+            "Mandatory evidence missing: Valid 5-task baseline gate check (gate.json) not found in logs/.\n"
+            "Run 'MODE=baselines docker compose up ...' to produce full gate evidence."
+        )
+    chosen_gate_dir = valid_gates[0]
+
+    # 2. Check genuine non-mock model runs
+    genuine_runs = []
+    success_traj = None
+    failure_traj = None
 
     for d in sorted(logs_dir.iterdir(), key=lambda p: p.name, reverse=True):
         if not d.is_dir():
             continue
-        if (d / "gate.json").is_file():
-            gate_dirs.append(d)
-        if (d / "summary.json").is_file():
+        summary_path = d / "summary.json"
+        if summary_path.is_file():
             try:
-                meta = json.loads((d / "summary.json").read_text(encoding="utf-8"))
-                model_runs.append((d, meta))
+                sdata = json.loads(summary_path.read_text(encoding="utf-8"))
+                model_name = str(sdata.get("model", ""))
+                is_called = sdata.get("model_called", False)
+                term = sdata.get("termination", "")
+                reward_total = sdata.get("reward", {}).get("total") if isinstance(sdata.get("reward"), dict) else None
+
+                # Must be genuine model call and not starting with mock/
+                if is_called and not model_name.startswith("mock/"):
+                    ep_file = d / "episode.jsonl"
+                    if not ep_file.is_file():
+                        candidates = list(d.glob("episode*.jsonl"))
+                        if candidates:
+                            ep_file = candidates[0]
+
+                    genuine_runs.append((d, sdata, ep_file))
+
+                    # Track success trajectory
+                    if term == "success" and reward_total is not None and reward_total >= 0.95 and not success_traj:
+                        if ep_file.is_file():
+                            success_traj = ep_file
+
+                    # Track failure trajectory (crash, time_cap, step_cap, failure, timeout, or score <= 0.05)
+                    if (term in ("crash", "time_cap", "step_cap", "failure", "timeout") or (reward_total is not None and reward_total <= 0.05)) and not failure_traj:
+                        if ep_file.is_file():
+                            failure_traj = ep_file
             except Exception:
                 pass
 
-    latest_gate = gate_dirs[0] if gate_dirs else None
+    if len(genuine_runs) < 3:
+        raise RuntimeError(
+            f"Mandatory evidence missing: Expected at least 3 genuine non-mock model runs in logs/, found {len(genuine_runs)}."
+        )
 
-    # Prioritize genuine live model runs (model_called == True)
-    live_runs = [item for item in model_runs if item[1].get("model_called")]
-    other_runs = [item for item in model_runs if not item[1].get("model_called")]
-    return latest_gate, live_runs + other_runs
+    if not success_traj:
+        raise RuntimeError("Mandatory evidence missing: Genuine success trajectory (episode.jsonl) not found in logs/.")
+
+    if not failure_traj:
+        raise RuntimeError("Mandatory evidence missing: Genuine failure trajectory (episode.jsonl) not found in logs/.")
+
+    return chosen_gate_dir, genuine_runs[:3], success_traj, failure_traj
 
 
 def assemble_zip(zip_paths: list):
+    gate_dir, selected_runs, success_traj, failure_traj = validate_and_find_evidence()
+
     bundle_dir = ROOT / "bundle_staging"
     if bundle_dir.exists():
         shutil.rmtree(bundle_dir)
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
-    latest_gate, model_runs = find_runs()
-
     # 1. baseline-results/
     base_res = bundle_dir / "baseline-results"
     base_res.mkdir(parents=True, exist_ok=True)
-    if latest_gate and (latest_gate / "gate.json").is_file():
-        shutil.copy(latest_gate / "gate.json", base_res / "gate.json")
-        if (latest_gate / "gate.jsonl").is_file():
-            shutil.copy(latest_gate / "gate.jsonl", base_res / "gate.jsonl")
+    shutil.copy(gate_dir / "gate.json", base_res / "gate.json")
+    if (gate_dir / "gate.jsonl").is_file():
+        shutil.copy(gate_dir / "gate.jsonl", base_res / "gate.jsonl")
 
     # 2. test-run-logs/
     test_logs = bundle_dir / "test-run-logs"
     test_logs.mkdir(parents=True, exist_ok=True)
-    selected_runs = model_runs[:3]
-    for idx, (r_dir, meta) in enumerate(selected_runs, 1):
+    for idx, (r_dir, meta, _) in enumerate(selected_runs, 1):
         m_name = meta.get("model", "model").replace("/", "_")
         t_name = meta.get("task", "task")
         dest = test_logs / f"run{idx}_{m_name}_{t_name}"
@@ -427,28 +478,16 @@ def assemble_zip(zip_paths: list):
     # 3. sample-trajectories/
     traj_dir = bundle_dir / "sample-trajectories"
     traj_dir.mkdir(parents=True, exist_ok=True)
-    success_traj = None
-    failure_traj = None
-    for r_dir, meta in model_runs:
-        ep_file = r_dir / "episode.jsonl"
-        if not ep_file.is_file():
-            ep_candidates = list(r_dir.glob("episode*.jsonl"))
-            if ep_candidates:
-                ep_file = ep_candidates[0]
-        if ep_file.is_file():
-            if meta.get("termination") == "success" and not success_traj:
-                success_traj = ep_file
-            elif meta.get("termination") in ("crash", "timeout", "max_steps") and not failure_traj:
-                failure_traj = ep_file
-
-    if success_traj:
-        shutil.copy(success_traj, traj_dir / "success_trajectory.jsonl")
-    if failure_traj:
-        shutil.copy(failure_traj, traj_dir / "failure_trajectory.jsonl")
+    shutil.copy(success_traj, traj_dir / "success_trajectory.jsonl")
+    shutil.copy(failure_traj, traj_dir / "failure_trajectory.jsonl")
 
     # 4. design-doc.pdf and deck.pdf
-    shutil.copy(SUBMISSION_DIR / "design-doc.pdf", bundle_dir / "design-doc.pdf")
-    shutil.copy(SUBMISSION_DIR / "deck.pdf", bundle_dir / "deck.pdf")
+    design_doc_path = SUBMISSION_DIR / "design-doc.pdf"
+    deck_path = SUBMISSION_DIR / "deck.pdf"
+    if not design_doc_path.is_file() or not deck_path.is_file():
+        raise RuntimeError("Mandatory evidence missing: PDFs must be generated before assembling ZIP.")
+    shutil.copy(design_doc_path, bundle_dir / "design-doc.pdf")
+    shutil.copy(deck_path, bundle_dir / "deck.pdf")
 
     # Assemble archives
     for zpath in zip_paths:
@@ -456,7 +495,7 @@ def assemble_zip(zip_paths: list):
         if zpath.exists():
             zpath.unlink()
         shutil.make_archive(str(zpath.with_suffix("")), "zip", str(bundle_dir))
-        print(f"Created submission archive: {zpath}")
+        print(f"Created verified submission archive: {zpath}")
 
     shutil.rmtree(bundle_dir)
 
@@ -468,7 +507,7 @@ if __name__ == "__main__":
     build_design_doc(design_doc_path)
     build_deck(deck_path)
 
-    # Produce both Astro.zip (PS requirement) and Aerosentinel.zip in project root and parent
+    # Produce both Astro.zip (PS requirement) and Aerosentinel.zip
     zip_targets = [
         ROOT.parent / "Astro.zip",
         ROOT / "Astro.zip",
@@ -476,4 +515,4 @@ if __name__ == "__main__":
         ROOT / "Aerosentinel.zip",
     ]
     assemble_zip(zip_targets)
-    print("\nAll submission deliverables successfully generated!")
+    print("\nAll submission deliverables successfully validated and generated!")

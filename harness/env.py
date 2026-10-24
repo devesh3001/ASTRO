@@ -1,73 +1,44 @@
 """The environment: reset / step / score, backed by the hardened sandbox service.
 
-All verifier logic and physics calculations run securely inside the harness.
-The agent cannot inspect, modify, or intercept grading logic.
+All verifier logic, authoritative episode state, and physics calculations run securely inside the harness.
+Untrusted agent Python code is NEVER executed inside the harness container; behavioural validation
+is executed via isolated unprivileged workers inside the sandbox container.
 """
 import configparser
 import hashlib
 import json
 import os
-import subprocess
-import sys
-import tempfile
+import random
 from pathlib import Path
 from typing import Dict, Any
 
 import requests
 
 from .tasks import build_task
-from .verifier import simulate_orbit
+from .verifier import (
+    AuthoritativeOrbitSimulator,
+    BATTERY_CAPACITY_WH,
+    SimulationResult,
+)
 
 PASS_SCORE = 0.95   # physical orbit survival & mission completion threshold
 
 
 def _verify_link_budget_behaviour(files: Dict[str, str]) -> bool:
-    """Dynamic behavioural verifier: executes link_budget.py against synthesized test configs.
-    
-    Verifies that the script genuinely imports and reads `path_loss_db` from `subsystems/comms.cfg`
-    and computes the Friis link margin dynamically, preventing simple comment or string loopholes.
-    """
-    script_content = files.get("scripts/link_budget.py", files.get("comms/link_budget.py", ""))
-    if not script_content:
+    """Helper used for offline physics validation of reference and no-op configurations."""
+    content = files.get("scripts/link_budget.py", files.get("comms/link_budget.py", ""))
+    if not content:
+        return False
+    import ast
+    try:
+        tree = ast.parse(content)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and node.value == "path_loss_db":
+                return True
+        return False
+    except Exception:
         return False
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
-        (root / "subsystems").mkdir(parents=True, exist_ok=True)
-        (root / "scripts").mkdir(parents=True, exist_ok=True)
-        (root / "scripts" / "link_budget.py").write_text(script_content, encoding="utf-8")
-
-        cmd = [sys.executable, "-c", "import sys; from scripts.link_budget import calc_margin; print(calc_margin())"]
-
-        # Test Vector 1: Nominal orbital parameters
-        # tx=30.0, gain=8.0, path_loss=141.5 -> Expected margin = 10.0 dB
-        cfg1 = "[comms]\ntx_power_dbm = 30.0\nantenna_gain_dbi = 8.0\npath_loss_db = 141.5\n"
-        (root / "subsystems" / "comms.cfg").write_text(cfg1, encoding="utf-8")
-        try:
-            p1 = subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=5)
-            if p1.returncode != 0:
-                return False
-            m1 = float(p1.stdout.strip())
-            if abs(m1 - 10.0) > 0.15:
-                return False
-        except Exception:
-            return False
-
-        # Test Vector 2: Dynamic variation test
-        # tx=25.0, gain=6.0, path_loss=135.0 -> Expected margin = (25 + 6 + 16) - 135 - 2.5 + 100 = 9.5 dB
-        cfg2 = "[comms]\ntx_power_dbm = 25.0\nantenna_gain_dbi = 6.0\npath_loss_db = 135.0\n"
-        (root / "subsystems" / "comms.cfg").write_text(cfg2, encoding="utf-8")
-        try:
-            p2 = subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=5)
-            if p2.returncode != 0:
-                return False
-            m2 = float(p2.stdout.strip())
-            if abs(m2 - 9.5) > 0.15:
-                return False
-        except Exception:
-            return False
-
-        return True
 
 
 class Env:
@@ -87,6 +58,8 @@ class Env:
                     pass
 
         self.task = None
+        self.sim: AuthoritativeOrbitSimulator = None
+        self.seed = 0
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -106,45 +79,8 @@ class Env:
         response.raise_for_status()
         return response.json()
 
-    # ---------------------------------------------------------------- reset
-    def reset(self, task_id: str, seed: int) -> str:
-        """Start a clean episode. The same (task_id, seed) always gives the same initial world."""
-        self.task = build_task(task_id, seed)
-        self._post("/reset", {"files": self.task.files}, self.tool_timeout)
-        return (
-            f"MISSION CONTROLLER ALERT: {self.task.instructions}\n\n"
-            "The onboard flight computer filesystem is accessible in the workspace.\n"
-            "Review `docs/flight_manual.md` for subsystem engineering limits and telemetry guides.\n"
-            "Use the provided tools to inspect telemetry, modify subsystem configurations, "
-            "verify behavior with `step_orbit` or `run_python`, then call `finish` to initiate orbital validation."
-        )
-
-    # ----------------------------------------------------------------- step
-    def step(self, name: str, args: dict):
-        """Run one tool call. Returns (text, is_error)."""
-        result = self._post("/tool", {"name": name, "args": args}, self.tool_timeout)
-        return result["output"], result["is_error"]
-
-    def state_hash(self) -> str:
-        response = requests.get(
-            self.url + "/state",
-            headers=self._headers(),
-            timeout=self.tool_timeout
-        )
-        files = response.json().get("files", {})
-        return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()[:8]
-
-    # ---------------------------------------------------------------- score
-    def score(self) -> Dict[str, Any]:
-        """Programmatic verifier: runs isolated orbital physics simulation on harness.
-        
-        Reads the satellite configuration files from the sandbox, validates engineering
-        invariants, and runs a 95-minute LEO orbit simulation to test actual survival.
-        """
-        response = self._post("/fetch_configs", {}, self.tool_timeout)
-        files = response.get("files", {})
-
-        # Parse configurations with safe defaults
+    def _parse_subsystem_configs(self, files: Dict[str, str]) -> Dict[str, float]:
+        """Extract all subsystem parameters with fallback defaults."""
         eps_cfg = configparser.ConfigParser()
         eps_cfg.read_string(files.get("subsystems/eps.cfg", files.get("eps.cfg", "")))
 
@@ -163,45 +99,173 @@ class Env:
             except Exception:
                 return default
 
-        solar_efficiency = safe_float(eps_cfg, "power", "solar_efficiency", 0.40)
-        undervoltage_threshold = safe_float(eps_cfg, "power", "undervoltage_threshold", 2.80)
-        wheel_bias_rpm = safe_float(adcs_cfg, "attitude", "wheel_bias_rpm", 120.0)
-        pointing_deadband_deg = safe_float(adcs_cfg, "attitude", "pointing_deadband_deg", 0.50)
-        control_gain = safe_float(adcs_cfg, "attitude", "control_gain", 1.0)
-        heater_setpoint_c = safe_float(thermal_cfg, "thermal", "battery_heater_setpoint", 65.0)
-        heater_hysteresis_c = safe_float(thermal_cfg, "thermal", "heater_hysteresis_c", 2.0)
-        thermal_cutoff_c = safe_float(thermal_cfg, "thermal", "thermal_cutoff_temp", 35.0)
-        tx_power_dbm = safe_float(comms_cfg, "comms", "tx_power_dbm", 20.0)
-        antenna_gain_dbi = safe_float(comms_cfg, "comms", "antenna_gain_dbi", 2.0)
-        path_loss_db = safe_float(comms_cfg, "comms", "path_loss_db", 141.5)
+        return {
+            "solar_efficiency": safe_float(eps_cfg, "power", "solar_efficiency", 0.40),
+            "undervoltage_threshold": safe_float(eps_cfg, "power", "undervoltage_threshold", 2.80),
+            "battery_capacity_wh": safe_float(eps_cfg, "power", "battery_capacity_wh", 40.0),
+            "wheel_bias_rpm": safe_float(adcs_cfg, "attitude", "wheel_bias_rpm", 120.0),
+            "pointing_deadband_deg": safe_float(adcs_cfg, "attitude", "pointing_deadband_deg", 0.50),
+            "control_gain": safe_float(adcs_cfg, "attitude", "control_gain", 1.0),
+            "battery_heater_setpoint": safe_float(thermal_cfg, "thermal", "battery_heater_setpoint", 65.0),
+            "heater_hysteresis_c": safe_float(thermal_cfg, "thermal", "heater_hysteresis_c", 2.0),
+            "thermal_cutoff_temp": safe_float(thermal_cfg, "thermal", "thermal_cutoff_temp", 35.0),
+            "tx_power_dbm": safe_float(comms_cfg, "comms", "tx_power_dbm", 20.0),
+            "antenna_gain_dbi": safe_float(comms_cfg, "comms", "antenna_gain_dbi", 2.0),
+            "path_loss_db": safe_float(comms_cfg, "comms", "path_loss_db", 141.5),
+            "baudrate_bps": safe_float(comms_cfg, "comms", "baudrate_bps", 9600.0),
+        }
 
-        # Dynamic behavioural verification of link budget script
-        script_behavior_ok = _verify_link_budget_behaviour(files)
+    # ---------------------------------------------------------------- reset
+    def reset(self, task_id: str, seed: int) -> str:
+        """Start a clean episode. The same (task_id, seed) always gives the same initial world."""
+        self.task = build_task(task_id, seed)
+        self.seed = seed
+        self._post("/reset", {"files": self.task.files}, self.tool_timeout)
 
-        # In tasks involving comms, if link_budget.py fails dynamic behavioural testing, penalize path loss
-        effective_path_loss = path_loss_db
-        if self.task and self.task.task_id in ("rf_downlink_closure", "safe_mode_cascade"):
-            if "scripts/link_budget.py" in self.task.files or "scripts/link_budget.py" in files:
-                if not script_behavior_ok:
-                    effective_path_loss = 175.0  # unresolved link calculation penalty
-
-        # Run orbital physics simulation
-        sim_result = simulate_orbit(
-            solar_efficiency=solar_efficiency,
-            undervoltage_threshold=undervoltage_threshold,
-            wheel_bias_rpm=wheel_bias_rpm,
-            pointing_deadband_deg=pointing_deadband_deg,
-            control_gain=control_gain,
-            heater_setpoint_c=heater_setpoint_c,
-            heater_hysteresis_c=heater_hysteresis_c,
-            thermal_cutoff_c=thermal_cutoff_c,
-            tx_power_dbm=tx_power_dbm,
-            antenna_gain_dbi=antenna_gain_dbi,
-            path_loss_db=effective_path_loss,
-            initial_soc_pct=self.task.initial_soc_pct if self.task else 70.0,
-            initial_temp_c=self.task.initial_temp_c if self.task else 14.0,
-            initial_pointing_error_deg=self.task.initial_pointing_error_deg if self.task else 35.0,
-            task_id=self.task.task_id if self.task else "",
+        # Initialize the single authoritative episode multi-physics simulator
+        self.sim = AuthoritativeOrbitSimulator(
+            initial_soc_pct=self.task.initial_soc_pct,
+            initial_temp_c=self.task.initial_temp_c,
+            initial_pointing_error_deg=self.task.initial_pointing_error_deg,
+            task_id=self.task.task_id,
         )
 
+        return (
+            f"MISSION CONTROLLER ALERT: {self.task.instructions}\n\n"
+            "The onboard flight computer filesystem is accessible in the workspace.\n"
+            "Review `docs/flight_manual.md` for subsystem engineering limits and telemetry guides.\n"
+            "Use the provided tools to inspect telemetry, modify subsystem configurations, "
+            "verify behavior with `step_orbit` or `run_python`, then call `finish` to initiate orbital validation."
+        )
+
+    # ----------------------------------------------------------------- step
+    def step(self, name: str, args: dict):
+        """Run one tool call. Returns (text, is_error).
+        
+        Interprets step_orbit on the authoritative simulator and advances virtual time
+        on all tools so actions incur physical consequences.
+        """
+        # Fetch current configs for physics evolution
+        cfg_resp = self._post("/fetch_configs", {}, self.tool_timeout)
+        configs = self._parse_subsystem_configs(cfg_resp.get("files", {}))
+
+        if name == "step_orbit":
+            try:
+                minutes = int(args.get("minutes", 10))
+            except (ValueError, TypeError):
+                minutes = 10
+            minutes = max(1, min(30, minutes))
+
+            frames = self.sim.advance(minutes * 60.0, configs, dt_s=60.0)
+
+            # Sync updated telemetry to sandbox
+            last_frame = frames[-1] if frames else None
+            if last_frame:
+                status_payload = {
+                    "elapsed_minutes": round(self.sim.time_s / 60.0, 1),
+                    "orbit_phase": "ECLIPSE" if last_frame.eclipse else "SUNLIGHT",
+                    "bus_voltage_v": last_frame.bus_voltage_v,
+                    "battery_soc_pct": last_frame.battery_soc_pct,
+                    "battery_temp_c": last_frame.battery_temp_c,
+                    "pointing_error_deg": last_frame.pointing_error_deg,
+                    "heater_active": last_frame.heater_active,
+                    "link_margin_db": last_frame.link_margin_db,
+                }
+                csv_lines = "".join(
+                    f"{round(f.time_s/60.0, 1)},{'ECLIPSE' if f.eclipse else 'SUNLIGHT'},"
+                    f"{f.bus_voltage_v},{f.battery_soc_pct},{f.battery_temp_c},"
+                    f"{f.pointing_error_deg},{f.link_margin_db},{'ON' if f.heater_active else 'OFF'}\n"
+                    for f in frames
+                )
+                try:
+                    self._post("/sync_telemetry", {"status": status_payload, "csv_append": csv_lines}, self.tool_timeout)
+                except Exception:
+                    pass
+
+                output = (
+                    f"Orbit advanced by {minutes} min (MET: {round(self.sim.time_s/60.0, 1)} min, "
+                    f"Phase: {'ECLIPSE' if last_frame.eclipse else 'SUNLIGHT'}).\n"
+                    f"Status: Bus={last_frame.bus_voltage_v}V, Battery SoC={last_frame.battery_soc_pct}%, "
+                    f"Temp={last_frame.battery_temp_c}°C, Pointing Err={last_frame.pointing_error_deg}°, "
+                    f"Link Margin={last_frame.link_margin_db} dB (Heater: {'ON' if last_frame.heater_active else 'OFF'}).\n"
+                    f"Updated telemetry in telemetry/live_telemetry.csv and telemetry/current_status.json"
+                )
+                if self.sim.catastrophic_failure:
+                    output += f"\n[CRITICAL WARNING]: Irreversible safety violation triggered: {self.sim.failure_reason}"
+                return output, False
+
+        # Regular tools consume 30 seconds of virtual OBC execution time
+        result = self._post("/tool", {"name": name, "args": args}, self.tool_timeout)
+        if self.sim:
+            cfg_resp = self._post("/fetch_configs", {}, self.tool_timeout)
+            configs = self._parse_subsystem_configs(cfg_resp.get("files", {}))
+            self.sim.advance(30.0, configs, dt_s=30.0)
+
+        return result["output"], result["is_error"]
+
+    def state_hash(self) -> str:
+        response = requests.get(
+            self.url + "/state",
+            headers=self._headers(),
+            timeout=self.tool_timeout
+        )
+        files = response.json().get("files", {})
+        return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()[:8]
+
+    # ---------------------------------------------------------------- score
+    def score(self) -> Dict[str, Any]:
+        """Programmatic verifier: scores the authoritative episode trajectory and completes the orbit.
+        
+        Evaluates behavioural execution via isolated worker inside sandbox (zero harness execution),
+        validates physical parameters, and computes the authoritative outcome-based reward.
+        """
+        response = self._post("/fetch_configs", {}, self.tool_timeout)
+        files = response.get("files", {})
+        configs = self._parse_subsystem_configs(files)
+
+        # Dynamic behavioural verification of link budget script on unprivileged sandbox worker
+        if self.task and self.task.task_id in ("rf_downlink_closure", "safe_mode_cascade"):
+            if "scripts/link_budget.py" in self.task.files or "scripts/link_budget.py" in files:
+                # Generate 3 randomized dynamic test vectors
+                rng = random.Random(self.seed ^ 0x5F3759DF)
+                test_cases = []
+                expected_margins = []
+                for _ in range(3):
+                    t_tx = round(rng.uniform(22.0, 32.0), 1)
+                    t_gain = round(rng.uniform(5.0, 15.0), 1)
+                    t_loss = round(rng.uniform(130.0, 150.0), 1)
+                    cfg_str = f"[comms]\ntx_power_dbm = {t_tx}\nantenna_gain_dbi = {t_gain}\npath_loss_db = {t_loss}\n"
+                    test_cases.append({"subsystems/comms.cfg": cfg_str})
+                    exp_m = round((t_tx + t_gain + 16.0) - t_loss - 2.5 - (-100.0), 2)
+                    expected_margins.append(exp_m)
+
+                eval_payload = {
+                    "script_relpath": "scripts/link_budget.py",
+                    "test_cases": test_cases,
+                }
+                try:
+                    eval_res = self._post("/eval_script", eval_payload, self.tool_timeout)
+                    actual_results = eval_res.get("results", [])
+                    behavior_ok = (len(actual_results) == 3 and all(
+                        r is not None and abs(r - exp) < 0.15
+                        for r, exp in zip(actual_results, expected_margins)
+                    ))
+                except Exception:
+                    behavior_ok = False
+
+                if not behavior_ok:
+                    configs["path_loss_db"] = 175.0  # unresolved calculation penalty
+
+        # Finalize projected orbit simulation through the 95-minute period
+        if not self.sim:
+            self.sim = AuthoritativeOrbitSimulator(
+                initial_soc_pct=self.task.initial_soc_pct if self.task else 70.0,
+                initial_temp_c=self.task.initial_temp_c if self.task else 14.0,
+                initial_pointing_error_deg=self.task.initial_pointing_error_deg if self.task else 35.0,
+                task_id=self.task.task_id if self.task else "",
+            )
+
+        import copy
+        sim_eval = copy.deepcopy(self.sim)
+        sim_result: SimulationResult = sim_eval.finalize_orbit(configs)
         return sim_result.reward

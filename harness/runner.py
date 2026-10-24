@@ -17,6 +17,7 @@ SYSTEM_PROMPT = (
 )
 TRIMMED = "[older tool output removed to save context]"
 TRIMMED_ARGS = '{"note": "arguments removed to save context"}'
+VERIFY_RESERVE_S = 15.0  # Monotonic reserved time for verifier finalization
 
 
 @dataclass
@@ -110,17 +111,21 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
     client.start(env.task)
     system = SYSTEM_PROMPT + (("\n\n" + append_text) if append_text else "")
     messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
-    started, termination, finished, steps = None, None, False, 0
+    started, deadline, termination, finished, steps = None, None, None, False, 0
 
     for step in range(1, limits.max_steps + 1):
-        if started is not None and time.monotonic() - started >= limits.max_seconds:
+        if started is None:
+            started = time.monotonic()                      # clock starts at the first request
+            deadline = started + limits.max_seconds
+
+        time_left = (deadline - VERIFY_RESERVE_S) - time.monotonic()
+        if time_left <= 0:
             termination = "time_cap"
             break
-        if started is None:
-            started = time.monotonic()                      # the clock starts here
+
         trim_history(messages, limits.context_budget_tokens)
         sent = copy.deepcopy(messages)
-        remaining = limits.max_seconds - (time.monotonic() - started)
+        call_timeout = max(2.0, min(60.0, time_left))
         call_start = time.monotonic()
         steps = step
         record = {"timestamp": now(), "agent": "model", "task": task_id, "step": step, "seed": seed,
@@ -128,7 +133,7 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
                   "errors": [], "state": {"hash": env.state_hash()}, "reward": None, "tokens": 0, "latency_ms": 0}
 
         try:
-            reply = client.complete(sent, TOOLS, timeout=max(5, min(120, remaining)))
+            reply = client.complete(sent, TOOLS, timeout=call_timeout)
         except Exception as exc:    # includes provider errors and context-window overflow
             record["errors"].append({"kind": "model_call_failed", "detail": f"{type(exc).__name__}: {exc}"})
             log.write(record)
@@ -157,6 +162,17 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
                              "available tools, or call `finish` if you are done."})
 
         for index, call in enumerate(reply.tool_calls):
+            # Check monotonic execution deadline before running tool
+            tool_time_left = (deadline - VERIFY_RESERVE_S) - time.monotonic()
+            if tool_time_left <= 0:
+                termination = "time_cap"
+                result = "not run: episode execution deadline exceeded"
+                record["errors"].append({"kind": "time_cap", "detail": "action exceeded remaining wall-clock budget"})
+                record["tool_result"].append(result)
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+                finished = True
+                break
+
             args, parse_error = call.parse()
             record["parsed_actions"].append({"tool": call.name, "args": args, "parse_error": parse_error})
             if finished:
