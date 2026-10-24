@@ -322,7 +322,8 @@ def do_eval_script(body):
 
     import tempfile
     for tc in test_cases:
-        temp_dir = Path(tempfile.mkdtemp(dir=WORKSPACE, prefix=".eval_"))
+        eval_base_dir = Path("/tmp") if Path("/tmp").is_dir() else Path(tempfile.gettempdir())
+        temp_dir = Path(tempfile.mkdtemp(dir=eval_base_dir, prefix="aero_eval_isolated_"))
         try:
             if hasattr(os, "getuid") and os.getuid() == 0:
                 try:

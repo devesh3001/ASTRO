@@ -138,68 +138,85 @@ class Env:
             "verify behavior with `step_orbit` or `run_python`, then call `finish` to initiate orbital validation."
         )
 
+    def _sync_sim_telemetry(self, frames: list):
+        """Update current_status.json and live_telemetry.csv in sandbox after physics evolution."""
+        if not frames or not self.sim:
+            return
+        last_frame = frames[-1]
+        status_payload = {
+            "elapsed_minutes": round(self.sim.time_s / 60.0, 1),
+            "orbit_phase": "ECLIPSE" if last_frame.eclipse else "SUNLIGHT",
+            "bus_voltage_v": last_frame.bus_voltage_v,
+            "battery_soc_pct": last_frame.battery_soc_pct,
+            "battery_temp_c": last_frame.battery_temp_c,
+            "pointing_error_deg": last_frame.pointing_error_deg,
+            "heater_active": last_frame.heater_active,
+            "link_margin_db": last_frame.link_margin_db,
+        }
+        csv_lines = "".join(
+            f"{round(f.time_s/60.0, 1)},{'ECLIPSE' if f.eclipse else 'SUNLIGHT'},"
+            f"{f.bus_voltage_v},{f.battery_soc_pct},{f.battery_temp_c},"
+            f"{f.pointing_error_deg},{f.link_margin_db},{'ON' if f.heater_active else 'OFF'}\n"
+            for f in frames
+        )
+        try:
+            self._post("/sync_telemetry", {"status": status_payload, "csv_append": csv_lines}, self.tool_timeout)
+        except Exception:
+            pass
+
     # ----------------------------------------------------------------- step
     def step(self, name: str, args: dict):
         """Run one tool call. Returns (text, is_error).
         
         Interprets step_orbit on the authoritative simulator and advances virtual time
-        on all tools so actions incur physical consequences.
+        on all tools so actions incur physical consequences. Capped at 95-minute mission boundary.
         """
         # Fetch current configs for physics evolution
         cfg_resp = self._post("/fetch_configs", {}, self.tool_timeout)
         configs = self._parse_subsystem_configs(cfg_resp.get("files", {}))
 
         if name == "step_orbit":
+            time_left_s = max(0.0, 5700.0 - self.sim.time_s)
+            if time_left_s <= 0.0:
+                return (
+                    "Mission evaluation orbit complete (MET: 95.0 min). The designated 95-minute observation "
+                    "window has concluded. Call `finish` to initiate final orbital scoring."
+                ), False
+
             try:
                 minutes = int(args.get("minutes", 10))
             except (ValueError, TypeError):
                 minutes = 10
-            minutes = max(1, min(30, minutes))
+            advance_s = min(max(1, minutes) * 60.0, time_left_s)
+            actual_min = round(advance_s / 60.0, 1)
 
-            frames = self.sim.advance(minutes * 60.0, configs, dt_s=60.0)
+            frames = self.sim.advance(advance_s, configs, dt_s=60.0)
+            self._sync_sim_telemetry(frames)
 
-            # Sync updated telemetry to sandbox
             last_frame = frames[-1] if frames else None
             if last_frame:
-                status_payload = {
-                    "elapsed_minutes": round(self.sim.time_s / 60.0, 1),
-                    "orbit_phase": "ECLIPSE" if last_frame.eclipse else "SUNLIGHT",
-                    "bus_voltage_v": last_frame.bus_voltage_v,
-                    "battery_soc_pct": last_frame.battery_soc_pct,
-                    "battery_temp_c": last_frame.battery_temp_c,
-                    "pointing_error_deg": last_frame.pointing_error_deg,
-                    "heater_active": last_frame.heater_active,
-                    "link_margin_db": last_frame.link_margin_db,
-                }
-                csv_lines = "".join(
-                    f"{round(f.time_s/60.0, 1)},{'ECLIPSE' if f.eclipse else 'SUNLIGHT'},"
-                    f"{f.bus_voltage_v},{f.battery_soc_pct},{f.battery_temp_c},"
-                    f"{f.pointing_error_deg},{f.link_margin_db},{'ON' if f.heater_active else 'OFF'}\n"
-                    for f in frames
-                )
-                try:
-                    self._post("/sync_telemetry", {"status": status_payload, "csv_append": csv_lines}, self.tool_timeout)
-                except Exception:
-                    pass
-
                 output = (
-                    f"Orbit advanced by {minutes} min (MET: {round(self.sim.time_s/60.0, 1)} min, "
+                    f"Orbit advanced by {actual_min} min (MET: {round(self.sim.time_s/60.0, 1)} min, "
                     f"Phase: {'ECLIPSE' if last_frame.eclipse else 'SUNLIGHT'}).\n"
                     f"Status: Bus={last_frame.bus_voltage_v}V, Battery SoC={last_frame.battery_soc_pct}%, "
                     f"Temp={last_frame.battery_temp_c}°C, Pointing Err={last_frame.pointing_error_deg}°, "
                     f"Link Margin={last_frame.link_margin_db} dB (Heater: {'ON' if last_frame.heater_active else 'OFF'}).\n"
                     f"Updated telemetry in telemetry/live_telemetry.csv and telemetry/current_status.json"
                 )
+                if round(self.sim.time_s / 60.0, 1) >= 95.0:
+                    output += "\n[NOTICE]: 95.0-minute mission boundary reached. Call `finish` to finalize."
                 if self.sim.catastrophic_failure:
                     output += f"\n[CRITICAL WARNING]: Irreversible safety violation triggered: {self.sim.failure_reason}"
                 return output, False
 
-        # Regular tools consume 30 seconds of virtual OBC execution time
+        # Regular tools consume 30 seconds of virtual OBC execution time (capped at 95 min)
         result = self._post("/tool", {"name": name, "args": args}, self.tool_timeout)
-        if self.sim:
+        if self.sim and self.sim.time_s < 5700.0:
             cfg_resp = self._post("/fetch_configs", {}, self.tool_timeout)
             configs = self._parse_subsystem_configs(cfg_resp.get("files", {}))
-            self.sim.advance(30.0, configs, dt_s=30.0)
+            advance_s = min(30.0, 5700.0 - self.sim.time_s)
+            frames = self.sim.advance(advance_s, configs, dt_s=30.0)
+            self._sync_sim_telemetry(frames)
 
         return result["output"], result["is_error"]
 
@@ -210,7 +227,19 @@ class Env:
             timeout=self.tool_timeout
         )
         files = response.json().get("files", {})
-        return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()[:8]
+        state_payload = {"files": files}
+        if self.sim:
+            state_payload["sim"] = {
+                "time_s": round(self.sim.time_s, 1),
+                "soc_wh": round(self.sim.soc_wh, 2),
+                "temp_c": round(self.sim.temp_c, 1),
+                "pointing_err_deg": round(self.sim.pointing_err_deg, 2),
+                "downlinked_kb": round(self.sim.total_downlinked_kb, 1),
+                "catastrophic_failure": bool(self.sim.catastrophic_failure),
+                "heater_on": bool(self.sim.heater_on),
+                "min_bus_v": round(self.sim.min_bus_v, 2),
+            }
+        return hashlib.sha256(json.dumps(state_payload, sort_keys=True).encode()).hexdigest()[:8]
 
     # ---------------------------------------------------------------- score
     def score(self) -> Dict[str, Any]:
@@ -253,6 +282,7 @@ class Env:
                 except Exception:
                     behavior_ok = False
 
+                configs["script_verified"] = behavior_ok
                 if not behavior_ok:
                     configs["path_loss_db"] = 175.0  # unresolved calculation penalty
 

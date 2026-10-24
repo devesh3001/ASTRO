@@ -69,14 +69,30 @@ FLIGHT_MANUAL_MD = """\
 
 ## 4. Communications Subsystem (COMMS)
 - **Transceiver:** UHF direct-to-ground downlink at 437.5 MHz (500 km LEO orbit).
-  - Nominal RF output power: `tx_power_dbm = 30.0` dBm (1.0 Watt).
-  - High-gain patch antenna: `antenna_gain_dbi = 8.0` dBi.
+  - Nominal RF output power: `tx_power_dbm = 30.0` dBm (1.0 Watt). Operational band: 28.0 to 32.0 dBm.
+  - High-gain patch antenna: `antenna_gain_dbi = 8.0` dBi. Operational band: 6.0 to 10.0 dBi.
   - 500 km LEO slant-range Free Space Path Loss (FSPL): `path_loss_db = 141.5` dB.
   - Ground Station Parameters: Receiver Gain `G_rx = 16.0` dBi, System Losses `L_sys = 2.5` dB, Demodulator Sensitivity `P_sens = -100.0` dBm.
   - Friis Link Margin Equation:
     `Margin (dB) = (tx_power_dbm + antenna_gain_dbi + 16.0) - path_loss_db - 2.5 - (-100.0)`
   - Required operational link margin for telemetry packet lock: >= 3.0 dB.
   - Link budget scripts must dynamically query `path_loss_db` from `subsystems/comms.cfg`.
+
+---
+
+## 5. Multi-Subsystem Telemetry Diagnostics & Fault Signatures
+When diagnosing anomalies from `telemetry/live_telemetry.csv` and `telemetry/current_status.json`, cross-correlate telemetry columns before modifying configurations:
+
+1. **Low Bus Voltage / Rapid Eclipse Drain:**
+   - *Check ADCS first:* If `pointing_err_deg` > 20°, off-sun tumble is causing panel cosine illumination loss, starving generation. Neutralize reaction wheel momentum bias (`wheel_bias_rpm = 0`) and tighten deadband.
+   - *Check EPS MPPT:* If pointing is nominal (<= 5°) but `bus_v` steadily degrades during sunlight, MPPT `solar_efficiency` has drifted below nominal (0.70 - 0.75).
+   - *Check TCS Heater Load:* If `heater = ON` continuously even when core temp > 20°C, stuck heater consumes 2.5W baseline load, accelerating battery depletion.
+
+2. **Battery Temperature Elevation / Thermal Warning:**
+   - Inspect `battery_heater_setpoint` vs `live_telemetry.csv` temp trend. If setpoint exceeds 30°C, the thermostat will drive cells toward the 50°C catastrophic runaway limit. Reconfigure setpoint to 15.0°C and cutoff to 45.0°C.
+
+3. **Loss of Telemetry / Blackout During Pass:**
+   - Verify link margin in `telemetry/current_status.json`. If negative or below 3.0 dB, check transceiver TX power (must be >= 28.0 dBm) and run `scripts/link_budget.py` to ensure it dynamically queries `path_loss_db` rather than using stale bench-test constants.
 """
 
 

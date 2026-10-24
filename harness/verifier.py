@@ -322,8 +322,13 @@ class AuthoritativeOrbitSimulator:
             adcs_score = 0.10
 
         # 4. Comms Closure (0.20) - Recalibrated to physical channel capacity (<= 576 kB)
+        # Verify script correctness independently of accumulated communication credit (Item 1)
+        script_verified = configs.get("script_verified", True)
         comms_score = 0.0
-        if self.min_link_margin_db >= 3.0 and self.total_downlinked_kb >= 350.0:
+        if self.task_id in ("rf_downlink_closure", "safe_mode_cascade") and not script_verified:
+            comms_score = 0.0
+            self.total_downlinked_kb = 0.0
+        elif self.min_link_margin_db >= 3.0 and self.total_downlinked_kb >= 350.0:
             comms_score = 0.20
         elif self.min_link_margin_db >= 0.0 and self.total_downlinked_kb >= 100.0:
             comms_score = 0.10
@@ -379,6 +384,7 @@ def simulate_orbit(
     initial_temp_c: float = 14.0,
     initial_pointing_error_deg: float = 30.0,
     task_id: str = "",
+    script_verified: bool = True,
 ) -> SimulationResult:
     configs = {
         "solar_efficiency": solar_efficiency,
@@ -392,6 +398,7 @@ def simulate_orbit(
         "tx_power_dbm": tx_power_dbm,
         "antenna_gain_dbi": antenna_gain_dbi,
         "path_loss_db": path_loss_db,
+        "script_verified": script_verified,
     }
     sim = AuthoritativeOrbitSimulator(
         initial_soc_pct=initial_soc_pct,

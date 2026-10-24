@@ -310,5 +310,140 @@ class TestTaskSeedsAndReproducibility(unittest.TestCase):
         self.assertNotEqual(t1.files, t2.files)
 
 
+class TestAdversarialScoringAndIsolation(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.test_token = "adversarial_scoring_test_secret"
+        srv._AUTH_TOKEN = cls.test_token
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+        cls.port = cls.server.server_address[1]
+        cls.base_url = f"http://127.0.0.1:{cls.port}"
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def test_rf_reward_bypass_prevention(self):
+        """Verify that rf_downlink_closure CANNOT receive credit if link_budget.py is unverified,
+        even if the agent steps through the entire orbit accumulating ground-pass communication."""
+        sim = AuthoritativeOrbitSimulator(
+            initial_soc_pct=70.0,
+            initial_temp_c=14.0,
+            initial_pointing_error_deg=5.0,
+            task_id="rf_downlink_closure",
+        )
+        nominal_cfg = {
+            "solar_efficiency": 0.72,
+            "undervoltage_threshold": 3.20,
+            "battery_capacity_wh": 40.0,
+            "wheel_bias_rpm": 0.0,
+            "pointing_deadband_deg": 0.05,
+            "control_gain": 2.0,
+            "battery_heater_setpoint": 15.0,
+            "heater_hysteresis_c": 2.0,
+            "thermal_cutoff_temp": 45.0,
+            "tx_power_dbm": 30.0,
+            "antenna_gain_dbi": 8.0,
+            "path_loss_db": 141.5,
+            "baudrate_bps": 9600.0,
+        }
+        # Step through the entire 95-minute orbit (including ground pass)
+        sim.advance(5700.0, nominal_cfg, dt_s=60.0)
+        self.assertGreaterEqual(sim.total_downlinked_kb, 350.0)
+
+        # Finalize with script_verified=False (unverified / broken script)
+        res = sim.finalize_orbit({**nominal_cfg, "script_verified": False})
+        self.assertFalse(res.passed)
+        self.assertEqual(res.reward["comms_closure"], 0.0)
+        self.assertEqual(res.reward["total"], 0.0)
+
+    def test_forged_telemetry_ignored_by_verifier(self):
+        """Verify that forging telemetry files in the workspace does not alter verifier score."""
+        from harness.env import Env
+        os.environ["HARNESS_SECRET"] = self.test_token
+        env = Env(self.base_url)
+        env.reset("eps_eclipse_recovery", 0)
+
+        # Forge status and CSV pretending everything is 100% nominal
+        fake_status = {
+            "elapsed_minutes": 95.0,
+            "bus_voltage_v": 4.20,
+            "battery_soc_pct": 100.0,
+            "battery_temp_c": 20.0,
+            "pointing_error_deg": 0.0,
+            "heater_active": False,
+            "link_margin_db": 10.0,
+        }
+        fake_file = srv.WORKSPACE / "telemetry" / "current_status.json"
+        fake_file.write_text(json.dumps(fake_status), encoding="utf-8")
+
+        # Score before applying actual EPS fixes must still be 0.00
+        score = env.score()
+        self.assertEqual(score["total"], 0.0)
+
+    def test_eval_script_leaves_no_artifacts_in_workspace(self):
+        """Verify that temporary evaluation directories are located outside the agent's workspace."""
+        headers = {
+            "Content-Type": "application/json",
+            "X-Harness-Secret": self.test_token,
+        }
+        req_reset = Request(
+            f"{self.base_url}/reset",
+            data=b'{"files": {"scripts/link_budget.py": "def calc_margin(): return 7.0\\n"}}',
+            headers=headers,
+        )
+        urlopen(req_reset)
+
+        eval_payload = json.dumps({
+            "script_relpath": "scripts/link_budget.py",
+            "test_cases": [{"subsystems/comms.cfg": "[comms]\n"}]
+        }).encode()
+        req_eval = Request(f"{self.base_url}/eval_script", data=eval_payload, headers=headers)
+        urlopen(req_eval)
+
+        # Check workspace contents: no .eval_* or aero_eval_* directories
+        workspace_items = [p.name for p in srv.WORKSPACE.iterdir()]
+        for item in workspace_items:
+            self.assertFalse(item.startswith(".eval_"))
+            self.assertFalse(item.startswith("aero_eval_"))
+
+    def test_state_hash_tracks_physical_sim_state(self):
+        """Verify that state_hash changes when simulation advances even with identical files."""
+        from harness.env import Env
+        os.environ["HARNESS_SECRET"] = self.test_token
+        env = Env(self.base_url)
+        env.reset("eps_eclipse_recovery", 0)
+
+        hash1 = env.state_hash()
+        env.step("step_orbit", {"minutes": 10})
+        hash2 = env.state_hash()
+        self.assertNotEqual(hash1, hash2, "State hash must reflect physical state changes")
+
+    def test_orbital_mission_cap_enforced(self):
+        """Verify that orbital stepping is capped at the 95-minute mission boundary."""
+        from harness.env import Env
+        os.environ["HARNESS_SECRET"] = self.test_token
+        env = Env(self.base_url)
+        env.reset("eps_eclipse_recovery", 0)
+
+        # Step 90 minutes
+        out1, err1 = env.step("step_orbit", {"minutes": 90})
+        self.assertFalse(err1)
+
+        # Attempt to step 30 more minutes (should cap at 95.0 total)
+        out2, err2 = env.step("step_orbit", {"minutes": 30})
+        self.assertFalse(err2)
+        self.assertIn("95.0 min", out2)
+        self.assertEqual(round(env.sim.time_s / 60.0, 1), 95.0)
+
+        # Subsequent step_orbit should report orbit already complete
+        out3, err3 = env.step("step_orbit", {"minutes": 10})
+        self.assertIn("Mission evaluation orbit complete", out3)
+
+
 if __name__ == "__main__":
     unittest.main()

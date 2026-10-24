@@ -57,6 +57,7 @@ def run_physics_validation():
             initial_temp_c=t.initial_temp_c,
             initial_pointing_error_deg=t.initial_pointing_error_deg,
             task_id=tid,
+            script_verified=script_ok,
         )
 
         # ------------------------------------------------------------- 2. Reference
@@ -88,6 +89,7 @@ def run_physics_validation():
             initial_temp_c=t.initial_temp_c,
             initial_pointing_error_deg=t.initial_pointing_error_deg,
             task_id=tid,
+            script_verified=ref_script_ok,
         )
 
         ref_ok = res_ref.reward["total"] >= 0.95

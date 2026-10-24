@@ -156,9 +156,11 @@ def build_design_doc(pdf_path: Path):
     weakness_data = [
         [Paragraph("<b>Known Vulnerability / Threat</b>", body_style), Paragraph("<b>Architectural Defense Implemented</b>", body_style)],
         [Paragraph("Agent attempts to inspect or tamper with verifier files", body_style), Paragraph("Verifier runs entirely in the separate Harness container; sandbox filesystem has zero grading code.", body_style)],
-        [Paragraph("Untrusted agent Python code executed in harness", body_style), Paragraph("All script evaluation runs via /eval_script inside the sandbox container under UID 1001 sandbox-agent.", body_style)],
+        [Paragraph("Untrusted agent Python code executed in harness", body_style), Paragraph("All script evaluation runs via /eval_script in /tmp outside /workspace under UID 1001 sandbox-agent.", body_style)],
+        [Paragraph("Agent steps orbit to accumulate comms data with broken script", body_style), Paragraph("RF comms score strictly gates on behavioural link budget script verification; unverified script zeros comms credit.", body_style)],
         [Paragraph("Agent submits comment-only bypass for link budget", body_style), Paragraph("Dynamic behavioural verification executes calc_margin() against 3 randomized test fixtures with varying path loss.", body_style)],
-        [Paragraph("Agent submits infinite loops (while True: pass) or memory hogs", body_style), Paragraph("Subprocess kills calls at 20 seconds; container enforces 512MB RAM and 256 PID limits.", body_style)],
+        [Paragraph("Agent forges current_status.json or live_telemetry.csv", body_style), Paragraph("Authoritative simulator maintains ground truth; workspace telemetry is write-synced and ignored during scoring.", body_style)],
+        [Paragraph("Agent calls unlimited step_orbit to exploit scoring", body_style), Paragraph("Episode mission window strictly capped at 95.0 minutes; extra stepping is clamped and triggers mission boundary alert.", body_style)],
         [Paragraph("Symlink or path traversal attack (../../etc/passwd)", body_style), Paragraph("safe_path() canonicalizes path via resolve() and checks relative_to(WORKSPACE), blocking /proc, /run, /etc.", body_style)],
         [Paragraph("Provider rate limit / context overflow exceeds 600s", body_style), Paragraph("Monotonic deadline tracks remaining time across API calls, 429 backoff retries, and tools, reserving 15s for verifier.", body_style)],
     ]
