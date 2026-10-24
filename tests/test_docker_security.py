@@ -55,6 +55,45 @@ class TestDockerSecurity(unittest.TestCase):
         with urlopen(req, timeout=20) as resp:
             return json.loads(resp.read().decode())
 
+    def test_container_process_cap_allows_children_and_blocks_excess(self):
+        """Exercise the actual cgroup cap without a host-UID-dependent NPROC limit."""
+        code = """
+import errno, json, os, signal, time
+from pathlib import Path
+limits = [Path('/sys/fs/cgroup/pids.max'), Path('/sys/fs/cgroup/pids/pids.max')]
+limit = next(int(p.read_text()) for p in limits if p.exists())
+children, blocked = [], False
+try:
+    for _ in range(140):
+        try:
+            pid = os.fork()
+        except OSError as exc:
+            if exc.errno != errno.EAGAIN:
+                raise
+            blocked = True
+            break
+        if pid == 0:
+            time.sleep(10)
+            os._exit(0)
+        children.append(pid)
+    print(json.dumps({'limit': limit, 'children': len(children), 'blocked': blocked}))
+finally:
+    for pid in children:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    for pid in children:
+        os.waitpid(pid, 0)
+"""
+        result = self._post_tool("run_python", {"code": code})
+        self.assertFalse(result["is_error"], result)
+        observed = json.loads(result["output"].strip())
+        self.assertEqual(observed["limit"], 128)
+        self.assertGreaterEqual(observed["children"], 40, observed)
+        self.assertLess(observed["children"], 128, observed)
+        self.assertTrue(observed["blocked"], observed)
+
     def test_container_process_identity(self):
         """Tool subprocesses must execute as unprivileged UID 1001 (sandbox-agent)."""
         code = "import os; print(f'UID={os.getuid() if hasattr(os, \"getuid\") else 1001}')"

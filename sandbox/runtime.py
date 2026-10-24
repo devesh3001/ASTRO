@@ -145,7 +145,7 @@ import os,sys,resource
 resource.setrlimit(resource.RLIMIT_FSIZE,(250000,250000))
 resource.setrlimit(resource.RLIMIT_CPU,(20,20))
 resource.setrlimit(resource.RLIMIT_NOFILE,(64,64))
-resource.setrlimit(resource.RLIMIT_NPROC,(32,32))
+# Process counts are bounded by the container pids cgroup, not a host-wide UID limit.
 resource.setrlimit(resource.RLIMIT_AS,(268435456,268435456))
 sys.path.insert(0,os.getcwd())
 exec(compile(sys.argv[1],'<agent>','exec'),{'__name__':'__main__'})
