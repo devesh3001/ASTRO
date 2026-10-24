@@ -60,6 +60,8 @@ class Env:
         self.task = None
         self.sim: AuthoritativeOrbitSimulator = None
         self.seed = 0
+        self._eval_cache: Dict[str, bool] = {}
+        self._eval_call_count: int = 0
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -80,18 +82,20 @@ class Env:
         return response.json()
 
     def _parse_subsystem_configs(self, files: Dict[str, str]) -> Dict[str, float]:
-        """Extract all subsystem parameters with fallback defaults."""
-        eps_cfg = configparser.ConfigParser()
-        eps_cfg.read_string(files.get("subsystems/eps.cfg", files.get("eps.cfg", "")))
+        """Extract all subsystem parameters with fallback defaults and graceful error recovery."""
+        def safe_read(raw: str) -> configparser.ConfigParser:
+            parser = configparser.ConfigParser()
+            if raw and raw.strip():
+                try:
+                    parser.read_string(raw)
+                except (configparser.Error, UnicodeDecodeError, ValueError):
+                    pass
+            return parser
 
-        adcs_cfg = configparser.ConfigParser()
-        adcs_cfg.read_string(files.get("subsystems/adcs.cfg", files.get("adcs.cfg", "")))
-
-        thermal_cfg = configparser.ConfigParser()
-        thermal_cfg.read_string(files.get("subsystems/thermal.cfg", files.get("thermal.cfg", "")))
-
-        comms_cfg = configparser.ConfigParser()
-        comms_cfg.read_string(files.get("subsystems/comms.cfg", files.get("comms.cfg", "")))
+        eps_cfg = safe_read(files.get("subsystems/eps.cfg", files.get("eps.cfg", "")))
+        adcs_cfg = safe_read(files.get("subsystems/adcs.cfg", files.get("adcs.cfg", "")))
+        thermal_cfg = safe_read(files.get("subsystems/thermal.cfg", files.get("thermal.cfg", "")))
+        comms_cfg = safe_read(files.get("subsystems/comms.cfg", files.get("comms.cfg", "")))
 
         def safe_float(parser, section, key, default):
             try:
@@ -120,6 +124,8 @@ class Env:
         """Start a clean episode. The same (task_id, seed) always gives the same initial world."""
         self.task = build_task(task_id, seed)
         self.seed = seed
+        self._eval_cache.clear()
+        self._eval_call_count = 0
         self._post("/reset", {"files": self.task.files}, self.tool_timeout)
 
         # Initialize the single authoritative episode multi-physics simulator
@@ -230,14 +236,19 @@ class Env:
         state_payload = {"files": files}
         if self.sim:
             state_payload["sim"] = {
-                "time_s": round(self.sim.time_s, 1),
-                "soc_wh": round(self.sim.soc_wh, 2),
-                "temp_c": round(self.sim.temp_c, 1),
-                "pointing_err_deg": round(self.sim.pointing_err_deg, 2),
-                "downlinked_kb": round(self.sim.total_downlinked_kb, 1),
+                "time_s": round(self.sim.time_s, 2),
+                "soc_wh": round(self.sim.soc_wh, 4),
+                "temp_c": round(self.sim.temp_c, 3),
+                "pointing_err_deg": round(self.sim.pointing_err_deg, 3),
+                "downlinked_kb": round(self.sim.total_downlinked_kb, 3),
                 "catastrophic_failure": bool(self.sim.catastrophic_failure),
+                "failure_reason": str(self.sim.failure_reason),
                 "heater_on": bool(self.sim.heater_on),
-                "min_bus_v": round(self.sim.min_bus_v, 2),
+                "min_bus_v": round(self.sim.min_bus_v, 4),
+                "max_temp_c": round(self.sim.max_temp_c, 3),
+                "min_temp_c": round(self.sim.min_temp_c, 3),
+                "max_pointing_err_deg": round(self.sim.max_pointing_err_deg, 3),
+                "min_link_margin_db": round(self.sim.min_link_margin_db, 3),
             }
         return hashlib.sha256(json.dumps(state_payload, sort_keys=True).encode()).hexdigest()[:8]
 
@@ -255,32 +266,45 @@ class Env:
         # Dynamic behavioural verification of link budget script on unprivileged sandbox worker
         if self.task and self.task.task_id in ("rf_downlink_closure", "safe_mode_cascade"):
             if "scripts/link_budget.py" in self.task.files or "scripts/link_budget.py" in files:
-                # Generate 3 randomized dynamic test vectors
-                rng = random.Random(self.seed ^ 0x5F3759DF)
-                test_cases = []
-                expected_margins = []
-                for _ in range(3):
-                    t_tx = round(rng.uniform(22.0, 32.0), 1)
-                    t_gain = round(rng.uniform(5.0, 15.0), 1)
-                    t_loss = round(rng.uniform(130.0, 150.0), 1)
-                    cfg_str = f"[comms]\ntx_power_dbm = {t_tx}\nantenna_gain_dbi = {t_gain}\npath_loss_db = {t_loss}\n"
-                    test_cases.append({"subsystems/comms.cfg": cfg_str})
-                    exp_m = round((t_tx + t_gain + 16.0) - t_loss - 2.5 - (-100.0), 2)
-                    expected_margins.append(exp_m)
+                script_content = files.get("scripts/link_budget.py", "")
+                script_hash = hashlib.sha256(script_content.encode("utf-8")).hexdigest()
+                cache_key = f"{script_hash}:{self.seed}"
 
-                eval_payload = {
-                    "script_relpath": "scripts/link_budget.py",
-                    "test_cases": test_cases,
-                }
-                try:
-                    eval_res = self._post("/eval_script", eval_payload, self.tool_timeout)
-                    actual_results = eval_res.get("results", [])
-                    behavior_ok = (len(actual_results) == 3 and all(
-                        r is not None and abs(r - exp) < 0.15
-                        for r, exp in zip(actual_results, expected_margins)
-                    ))
-                except Exception:
+                if cache_key in self._eval_cache:
+                    behavior_ok = self._eval_cache[cache_key]
+                elif self._eval_call_count >= 12:
+                    # Strict cumulative evaluation limit to protect 10-minute budget
                     behavior_ok = False
+                else:
+                    self._eval_call_count += 1
+                    # Generate 3 randomized dynamic test vectors
+                    rng = random.Random(self.seed ^ 0x5F3759DF)
+                    test_cases = []
+                    expected_margins = []
+                    for _ in range(3):
+                        t_tx = round(rng.uniform(22.0, 32.0), 1)
+                        t_gain = round(rng.uniform(5.0, 15.0), 1)
+                        t_loss = round(rng.uniform(130.0, 150.0), 1)
+                        cfg_str = f"[comms]\ntx_power_dbm = {t_tx}\nantenna_gain_dbi = {t_gain}\npath_loss_db = {t_loss}\n"
+                        test_cases.append({"subsystems/comms.cfg": cfg_str})
+                        exp_m = round((t_tx + t_gain + 16.0) - t_loss - 2.5 - (-100.0), 2)
+                        expected_margins.append(exp_m)
+
+                    eval_payload = {
+                        "script_relpath": "scripts/link_budget.py",
+                        "test_cases": test_cases,
+                    }
+                    try:
+                        eval_res = self._post("/eval_script", eval_payload, self.tool_timeout)
+                        actual_results = eval_res.get("results", [])
+                        behavior_ok = (len(actual_results) == 3 and all(
+                            r is not None and abs(r - exp) < 0.15
+                            for r, exp in zip(actual_results, expected_margins)
+                        ))
+                    except Exception:
+                        behavior_ok = False
+
+                    self._eval_cache[cache_key] = behavior_ok
 
                 configs["script_verified"] = behavior_ok
                 if not behavior_ok:

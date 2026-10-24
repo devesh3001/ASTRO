@@ -35,6 +35,10 @@ jobs:
         run: |
           python tests/test_adversarial.py
 
+      - name: Run Extended 100-Seed Suite Across All 5 Tasks
+        run: |
+          python -m unittest tests/test_seeds_extended.py
+
       - name: Build Docker Services
         run: |
           docker compose build
@@ -42,3 +46,9 @@ jobs:
       - name: Run Baselines Gate in Isolated Containers
         run: |
           MODE=baselines docker compose up --abort-on-container-exit --exit-code-from harness
+
+      - name: Run Live Docker Security & Privilege Separation Suite
+        run: |
+          docker compose up -d sandbox
+          docker compose run --rm -v "${PWD}/tests:/app/tests" -e FAIL_ON_UNAVAILABLE=1 -e SANDBOX_URL=http://sandbox:8000 harness python -m unittest tests.test_docker_security
+          docker compose down

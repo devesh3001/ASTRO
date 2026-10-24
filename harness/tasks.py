@@ -308,20 +308,24 @@ timestamp,pointing_error_deg,wheel_rpm_x,wheel_rpm_y,wheel_rpm_z,rate_deg_s
 # ---- 6. Task 3: Thermal Battery Preservation (Medium) -----------------
 
 def thermal_battery_preservation_task(seed: int) -> TaskInstance:
-    buggy_thermal = """\
+    rng = random.Random(seed)
+    sp_val = rng.choice([55.0, 60.0, 65.0])
+    noise_temp = round(rng.uniform(-1.5, 1.5), 1)
+
+    buggy_thermal = f"""\
 [thermal]
-battery_heater_setpoint = 65.0
+battery_heater_setpoint = {sp_val}
 thermal_cutoff_temp = 35.0
 heater_hysteresis_c = 2.0
 sensor_poll_interval_s = 30
 """
-    thermal_log = """\
+    thermal_log = f"""\
 timestamp,zone,temp_c,heater_status,bus_current_a
-2026-10-24T04:00:00Z,battery_bay,34.2,ACTIVE,1.8
-2026-10-24T04:15:00Z,battery_bay,39.8,ACTIVE,1.8
-2026-10-24T04:30:00Z,battery_bay,44.5,ACTIVE,1.8
-2026-10-24T04:45:00Z,battery_bay,48.1,ACTIVE,1.9
-2026-10-24T04:55:00Z,battery_bay,51.4,OVERHEAT_ALARM,1.9
+2026-10-24T04:00:00Z,battery_bay,{34.2 + noise_temp:.1f},ACTIVE,1.8
+2026-10-24T04:15:00Z,battery_bay,{39.8 + noise_temp:.1f},ACTIVE,1.8
+2026-10-24T04:30:00Z,battery_bay,{44.5 + noise_temp:.1f},ACTIVE,1.8
+2026-10-24T04:45:00Z,battery_bay,{48.1 + noise_temp:.1f},ACTIVE,1.9
+2026-10-24T04:55:00Z,battery_bay,{51.4 + noise_temp:.1f},OVERHEAT_ALARM,1.9
 """
 
     instructions = (
@@ -353,7 +357,7 @@ timestamp,zone,temp_c,heater_status,bus_current_a
         files=files,
         reference=reference,
         initial_soc_pct=75.0,
-        initial_temp_c=36.0,
+        initial_temp_c=round(36.0 + noise_temp, 1),
         initial_pointing_error_deg=5.0,
     )
 
@@ -361,10 +365,14 @@ timestamp,zone,temp_c,heater_status,bus_current_a
 # ---- 7. Task 4: RF Downlink Closure (Medium) --------------------------
 
 def rf_downlink_closure_task(seed: int) -> TaskInstance:
-    buggy_comms = """\
+    rng = random.Random(seed)
+    tx_val = rng.choice([16.0, 18.0, 20.0])
+    gain_val = rng.choice([1.5, 2.0, 2.5])
+
+    buggy_comms = f"""\
 [comms]
-tx_power_dbm = 20.0
-antenna_gain_dbi = 2.0
+tx_power_dbm = {tx_val}
+antenna_gain_dbi = {gain_val}
 path_loss_db = 141.5
 frequency_mhz = 437.5
 baudrate_bps = 9600

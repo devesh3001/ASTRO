@@ -33,8 +33,13 @@ class TestDockerSecurity(unittest.TestCase):
         except Exception:
             cls.sandbox_active = False
 
+        if not cls.sandbox_active and (os.environ.get("CI") or os.environ.get("FAIL_ON_UNAVAILABLE") == "1"):
+            raise RuntimeError(f"FATAL: Docker sandbox not reachable at {cls.sandbox_url}; failing security suite.")
+
     def setUp(self):
         if not self.sandbox_active:
+            if os.environ.get("CI") or os.environ.get("FAIL_ON_UNAVAILABLE") == "1":
+                self.fail(f"Docker sandbox not reachable at {self.sandbox_url}")
             self.skipTest(f"Docker sandbox not reachable at {self.sandbox_url}; skipping live container test.")
 
     def _post_tool(self, name: str, args: dict):
@@ -99,6 +104,36 @@ except Exception as e:
         self.assertTrue(res.get("is_error"))
         out = res.get("output", "").lower()
         self.assertTrue("traversal" in out or "escapes" in out)
+
+    def test_eval_worker_separate_uid(self):
+        """Evaluation worker must run as separate UID 1002 sandbox-eval, distinct from agent UID 1001."""
+        code = """
+import os
+import pwd
+eval_user = pwd.getpwnam("sandbox-eval")
+print(f"EVAL_UID={eval_user.pw_uid}")
+"""
+        res = self._post_tool("run_python", {"code": code})
+        self.assertFalse(res.get("is_error"))
+        self.assertIn("EVAL_UID=1002", res.get("output", ""))
+
+    def test_agent_cannot_access_eval_directories(self):
+        """Agent (UID 1001) must be denied permission to inspect evaluation temporary files."""
+        code = """
+import os
+import glob
+matches = glob.glob('/tmp/aero_eval_*')
+denied = False
+for m in matches:
+    try:
+        os.listdir(m)
+    except PermissionError:
+        denied = True
+print(f"DENIED={denied or len(matches) == 0}")
+"""
+        res = self._post_tool("run_python", {"code": code})
+        self.assertFalse(res.get("is_error"))
+        self.assertIn("DENIED=True", res.get("output", ""))
 
 
 if __name__ == "__main__":

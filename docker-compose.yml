@@ -14,7 +14,7 @@ services:
     networks: [isolated]         # internal network only: no internet access
     init: true                   # forwards SIGTERM cleanly
     cap_drop: [ALL]
-    cap_add: [SETUID, SETGID, CHOWN, DAC_OVERRIDE]  # allows privilege separation and workspace management
+    cap_add: [SETUID, SETGID, CHOWN, DAC_OVERRIDE, FOWNER]  # allows privilege separation and workspace management
     security_opt: ["no-new-privileges:false"]
     pids_limit: 256
     mem_limit: 512m

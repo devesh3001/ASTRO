@@ -46,6 +46,10 @@ WORKSPACE.mkdir(parents=True, exist_ok=True)
 PORT = int(os.environ.get("PORT", "8000"))
 MAX_OUTPUT = 4000          # characters returned to agent per tool call
 RUN_TIMEOUT = 20           # seconds timeout per command
+MAX_FILE_BYTES = 250_000         # 250 KB per single file write
+MAX_WORKSPACE_BYTES = 10_000_000 # 10 MB total workspace storage
+MAX_PATH_LENGTH = 250            # maximum path characters
+MAX_PATH_DEPTH = 10              # maximum directory nesting depth
 
 # ---- Secure Dynamic Token Generation ---------------------------------
 SECRET_FILE = Path("/run/aerosentinel/harness_secret.txt")
@@ -71,7 +75,14 @@ if not _AUTH_TOKEN:
 
 def safe_path(relative: str) -> Path:
     """Ensure path stays strictly within the workspace directory, preventing directory traversal and symlink escapes."""
+    if not isinstance(relative, str) or not relative.strip():
+        raise ValueError("path must be a non-empty string")
     rel = str(relative).replace("\\", "/").strip()
+    if len(rel) > MAX_PATH_LENGTH:
+        raise ValueError(f"path length {len(rel)} exceeds maximum limit of {MAX_PATH_LENGTH} characters")
+    parts = [p for p in rel.split("/") if p]
+    if len(parts) > MAX_PATH_DEPTH:
+        raise ValueError(f"path depth {len(parts)} exceeds maximum limit of {MAX_PATH_DEPTH} directories")
     if rel.startswith("/") or ".." in rel.split("/"):
         raise ValueError("path traversal blocked: relative path must not contain '..' or leading '/'")
 
@@ -82,7 +93,7 @@ def safe_path(relative: str) -> Path:
         raise ValueError(f"path traversal blocked: path '{relative}' resolves outside workspace")
 
     # Block access to system paths or private runtime directories
-    for blocked in ("/run", "/proc", "/sys", "/etc", "/dev", "/root", "/var"):
+    for blocked in ("/run", "/proc", "/sys", "/etc", "/dev", "/root", "/var", "/tmp"):
         if str(target).startswith(blocked):
             raise ValueError(f"access to system directory '{blocked}' is strictly forbidden")
 
@@ -141,8 +152,16 @@ def tool_read_file(args):
 
 def tool_write_file(args):
     path = safe_path(args["path"])
-    path.parent.mkdir(parents=True, exist_ok=True)
     content = args["content"]
+    content_bytes = content.encode("utf-8")
+    if len(content_bytes) > MAX_FILE_BYTES:
+        raise ValueError(f"file size {len(content_bytes)} bytes exceeds maximum limit of {MAX_FILE_BYTES} bytes")
+
+    total_storage = sum(p.stat().st_size for p in all_files(WORKSPACE) if p != path)
+    if total_storage + len(content_bytes) > MAX_WORKSPACE_BYTES:
+        raise ValueError(f"total workspace storage exceeds limit of {MAX_WORKSPACE_BYTES} bytes")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return f"wrote {len(content)} characters to {args['path']}"
 
@@ -284,10 +303,10 @@ def do_state(_body=None):
 
 
 def do_eval_script(body):
-    """Execute an agent script in an isolated ephemeral directory as sandbox-agent (UID 1001).
+    """Execute an agent script in an isolated ephemeral directory as isolated sandbox-eval (UID 1002).
     
     Used exclusively by the trusted harness verifier. The untrusted code never executes
-    inside the harness container.
+    inside the harness container, and runs under a distinct worker identity from the agent.
     """
     script_rel = body.get("script_relpath", "scripts/link_budget.py")
     test_cases = body.get("test_cases", [])
@@ -298,50 +317,68 @@ def do_eval_script(body):
     script_code = script_path.read_text(encoding="utf-8", errors="replace")
     results = []
 
+    eval_user_name = "sandbox-eval"
+    eval_uid = None
+    eval_gid = None
+    if hasattr(os, "getuid") and os.getuid() == 0:
+        try:
+            import pwd
+            try:
+                eval_pwnam = pwd.getpwnam("sandbox-eval")
+            except KeyError:
+                eval_pwnam = pwd.getpwnam("sandbox-agent")
+            eval_uid = eval_pwnam.pw_uid
+            eval_gid = eval_pwnam.pw_gid
+            eval_user_name = eval_pwnam.pw_name
+        except Exception:
+            pass
+
     clean_env = {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONUNBUFFERED": "1",
-        "HOME": "/home/sandbox-agent" if Path("/home/sandbox-agent").exists() else str(WORKSPACE),
-        "USER": "sandbox-agent",
+        "HOME": f"/home/{eval_user_name}" if Path(f"/home/{eval_user_name}").exists() else "/tmp",
+        "USER": eval_user_name,
     }
     kwargs = {
         "capture_output": True,
         "text": True,
-        "timeout": 5,
+        "timeout": 3,
         "env": clean_env,
     }
-    if hasattr(os, "getuid") and os.getuid() == 0:
-        try:
-            import pwd
-            agent_user = pwd.getpwnam("sandbox-agent")
-            kwargs["user"] = agent_user.pw_uid
-            kwargs["group"] = agent_user.pw_gid
-        except Exception:
-            pass
+    if eval_uid is not None:
+        kwargs["user"] = eval_uid
+        kwargs["group"] = eval_gid
 
     import tempfile
     for tc in test_cases:
         eval_base_dir = Path("/tmp") if Path("/tmp").is_dir() else Path(tempfile.gettempdir())
         temp_dir = Path(tempfile.mkdtemp(dir=eval_base_dir, prefix="aero_eval_isolated_"))
         try:
-            if hasattr(os, "getuid") and os.getuid() == 0:
-                try:
-                    import pwd
-                    agent_user = pwd.getpwnam("sandbox-agent")
-                    os.chown(temp_dir, agent_user.pw_uid, agent_user.pw_gid)
-                    os.chmod(temp_dir, 0o777)
-                except Exception:
-                    pass
+            os.chmod(temp_dir, 0o700)  # Restricted solely to sandbox-eval
 
             (temp_dir / "scripts").mkdir(parents=True, exist_ok=True)
             (temp_dir / "subsystems").mkdir(parents=True, exist_ok=True)
+
             (temp_dir / "scripts" / "link_budget.py").write_text(script_code, encoding="utf-8")
 
             for fname, content in tc.items():
                 p = temp_dir / fname
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_text(content, encoding="utf-8")
+
+            if eval_uid is not None:
+                for root, dirs, files_in_dir in os.walk(temp_dir):
+                    for d in dirs:
+                        p_dir = os.path.join(root, d)
+                        os.chmod(p_dir, 0o777)
+                        os.chown(p_dir, eval_uid, eval_gid)
+                    for f in files_in_dir:
+                        p_file = os.path.join(root, f)
+                        os.chmod(p_file, 0o666)
+                        os.chown(p_file, eval_uid, eval_gid)
+                os.chmod(temp_dir, 0o700)
+                os.chown(temp_dir, eval_uid, eval_gid)
 
             runner_code = "import sys; from scripts.link_budget import calc_margin; print(calc_margin())"
             proc = subprocess.run([sys.executable, "-c", runner_code], cwd=temp_dir, **kwargs)
@@ -426,6 +463,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, {"error": "forbidden: unauthorized call to privileged endpoint"})
         try:
             length = int(self.headers.get("Content-Length", 0))
+            if length > 2 * 1024 * 1024:
+                return self._send(413, {"error": "payload too large (maximum 2 MB)"})
             body = json.loads(self.rfile.read(length) or b"{}")
             self._send(200, handler(body))
         except Exception as exc:

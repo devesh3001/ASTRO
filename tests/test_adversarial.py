@@ -444,6 +444,94 @@ class TestAdversarialScoringAndIsolation(unittest.TestCase):
         out3, err3 = env.step("step_orbit", {"minutes": 10})
         self.assertIn("Mission evaluation orbit complete", out3)
 
+    def test_malformed_ini_configuration_handling(self):
+        """Verify that malformed INI files do not crash the verifier or environment."""
+        from harness.env import Env
+        os.environ["HARNESS_SECRET"] = self.test_token
+        env = Env(self.base_url)
+        env.reset("eps_eclipse_recovery", 0)
+
+        # Write corrupted INI syntax to eps.cfg
+        corrupted_content = "[unclosed_section\nsolar_efficiency = corrupt\n::bad_syntax::"
+        env.step("write_file", {"path": "subsystems/eps.cfg", "content": corrupted_content})
+
+        # Scoring must not crash with an uncaught exception
+        score = env.score()
+        self.assertIsInstance(score, dict)
+        self.assertEqual(score["total"], 0.0)
+
+    def test_alternative_valid_solutions_accepted(self):
+        """Verify that an alternative physically valid configuration scores >= 0.95."""
+        from harness.verifier import simulate_orbit
+        res = simulate_orbit(
+            solar_efficiency=0.75,
+            undervoltage_threshold=3.25,
+            wheel_bias_rpm=0.0,
+            pointing_deadband_deg=0.04,
+            control_gain=2.2,
+            heater_setpoint_c=16.0,
+            heater_hysteresis_c=2.0,
+            thermal_cutoff_c=44.0,
+            tx_power_dbm=30.0,
+            antenna_gain_dbi=8.0,
+            path_loss_db=141.5,
+            initial_soc_pct=70.0,
+            initial_temp_c=14.0,
+            initial_pointing_error_deg=35.0,
+            task_id="eps_eclipse_recovery",
+            script_verified=True,
+        )
+        self.assertTrue(res.passed)
+        self.assertGreaterEqual(res.reward["total"], 0.95)
+
+    def test_file_size_and_workspace_limits(self):
+        """Verify that file writes exceeding 250 KB or path depth > 10 are rejected."""
+        # Oversized file
+        oversized = "X" * (srv.MAX_FILE_BYTES + 1000)
+        with self.assertRaises(ValueError):
+            srv.tool_write_file({"path": "huge.bin", "content": oversized})
+
+        # Excessive path depth
+        deep_path = "a/b/c/d/e/f/g/h/i/j/k/l/m/file.txt"
+        with self.assertRaises(ValueError):
+            srv.safe_path(deep_path)
+
+        # Excessive path length
+        long_path = "a/" * 130 + "test.txt"
+        with self.assertRaises(ValueError):
+            srv.safe_path(long_path)
+
+    def test_malformed_tool_requests(self):
+        """Verify that unknown tools and invalid argument formats return error without crashing."""
+        # Unknown tool
+        res1 = srv.do_tool({"name": "nonexistent_tool", "args": {}})
+        self.assertTrue(res1["is_error"])
+        self.assertIn("unknown tool", res1["output"])
+
+        # Invalid arguments for read_file
+        res2 = srv.do_tool({"name": "read_file", "args": {}})
+        self.assertTrue(res2["is_error"])
+
+    def test_script_evaluation_caching(self):
+        """Verify that repeated evaluation of the same script content utilizes the cache."""
+        from harness.env import Env
+        os.environ["HARNESS_SECRET"] = self.test_token
+        env = Env(self.base_url)
+        env.reset("rf_downlink_closure", 0)
+
+        # First score performs verification
+        env.score()
+        cache_len_1 = len(env._eval_cache)
+        calls_1 = env._eval_call_count
+
+        # Second score on same state must reuse cache without extra sandbox calls
+        env.score()
+        cache_len_2 = len(env._eval_cache)
+        calls_2 = env._eval_call_count
+
+        self.assertEqual(cache_len_1, cache_len_2)
+        self.assertEqual(calls_1, calls_2)
+
 
 if __name__ == "__main__":
     unittest.main()

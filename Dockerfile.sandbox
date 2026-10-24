@@ -1,9 +1,10 @@
 # Hardened sandbox: isolated execution with privilege separation
 FROM python:3.12-slim
 
-# Create separate service account (UID 1000) and unprivileged agent execution account (UID 1001)
+# Create separate service account (UID 1000), agent execution account (UID 1001), and isolated verifier worker (UID 1002)
 RUN groupadd -g 1000 srvgroup && useradd -u 1000 -g srvgroup -m sandbox-server \
  && groupadd -g 1001 agentgroup && useradd -u 1001 -g agentgroup -m sandbox-agent \
+ && groupadd -g 1002 evalgroup && useradd -u 1002 -g evalgroup -m sandbox-eval \
  && mkdir -p /workspace && chown sandbox-agent:agentgroup /workspace && chmod 777 /workspace \
  && mkdir -p /run/aerosentinel && chmod 700 /run/aerosentinel
 
