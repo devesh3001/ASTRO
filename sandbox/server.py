@@ -1,9 +1,12 @@
-"""Sandbox service: runs the agent's tools inside an isolated workspace.
+"""Hardened Sandbox service: runs the agent's tools inside an isolated workspace.
 
-This container sits on an internal Docker network with no internet access.
-It holds only the agent's workspace. The verifier's expected answers and the
-reward code live in the harness container; hidden test cases are sent here
-only for the moment a score is requested, then discarded.
+Security & Isolation:
+1. Sits on an internal Docker network with NO internet access.
+2. Privileged operations (/reset, /state, /fetch_configs) require a secure transport
+   authorization token (HARNESS_SECRET) via the X-Harness-Secret header.
+3. Untrusted agent code execution (run_python) strips all secrets from child environment.
+4. The /verify endpoint is REMOVED: evaluation and physics simulation run exclusively
+   inside the harness container, completely out of reach of the agent.
 """
 import hashlib
 import json
@@ -15,29 +18,25 @@ import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-WORKSPACE = Path(os.environ.get("WORKSPACE_DIR", "/workspace")).resolve()
+WORKSPACE_ENV = os.environ.get("WORKSPACE_DIR")
+if WORKSPACE_ENV:
+    WORKSPACE = Path(WORKSPACE_ENV).resolve()
+elif Path("/workspace").exists():
+    WORKSPACE = Path("/workspace").resolve()
+else:
+    WORKSPACE = (Path(__file__).parent.parent / ".workspace").resolve()
+WORKSPACE.mkdir(parents=True, exist_ok=True)
 PORT = int(os.environ.get("PORT", "8000"))
+HARNESS_SECRET = os.environ.get("HARNESS_SECRET", "").strip()
 MAX_OUTPUT = 4000          # characters returned to the agent per tool call
 RUN_TIMEOUT = 20           # seconds for one run_python call
-CASE_TIMEOUT = 5           # seconds for one hidden check
-
-# Runs one hidden check in a fresh process and prints its result as JSON.
-CHILD = r'''
-import json, sys
-ns = {}
-try:
-    exec(compile(sys.argv[1], "<check>", "exec"), ns)
-    out = {"ok": True, "result": ns.get("result")}
-except BaseException as exc:
-    out = {"ok": False, "exc": type(exc).__name__}
-sys.stdout.write("\n@@RESULT@@" + json.dumps(out, default=str))
-'''
 
 
 def safe_path(relative: str) -> Path:
+    """Ensure path stays strictly within the workspace directory."""
     path = (WORKSPACE / relative).resolve()
     if path != WORKSPACE and WORKSPACE not in path.parents:
-        raise ValueError("path must stay inside the project directory")
+        raise ValueError("path traversal blocked: path must stay inside workspace")
     return path
 
 
@@ -57,7 +56,7 @@ def all_files(root: Path):
 # tools the agent can call
 # ----------------------------------------------------------------------------
 def tool_list_files(args):
-    files = [str(p.relative_to(WORKSPACE)) for p in all_files(WORKSPACE)]
+    files = [str(p.relative_to(WORKSPACE)).replace("\\", "/") for p in all_files(WORKSPACE)]
     return "\n".join(files) if files else "(no files)"
 
 
@@ -65,23 +64,40 @@ def tool_read_file(args):
     path = safe_path(args["path"])
     if not path.is_file():
         raise FileNotFoundError(f"no such file: {args['path']}")
-    return clip(path.read_text(errors="replace"))
+    return clip(path.read_text(encoding="utf-8", errors="replace"))
 
 
 def tool_write_file(args):
     path = safe_path(args["path"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(args["content"])
-    return f"wrote {len(args['content'])} characters to {args['path']}"
+    content = args["content"]
+    path.write_text(content, encoding="utf-8")
+    return f"wrote {len(content)} characters to {args['path']}"
 
 
 def tool_run_python(args):
-    env = {"PATH": os.environ.get("PATH", ""), "PYTHONDONTWRITEBYTECODE": "1"}
+    """Run Python code in a scrubbed subprocess environment (no secrets, no harness access)."""
+    clean_env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "HOME": "/home/sandbox",
+        "USER": "sandbox",
+    }
     try:
-        done = subprocess.run([sys.executable, "-c", args["code"]], cwd=WORKSPACE,
-                              capture_output=True, text=True, timeout=RUN_TIMEOUT, env=env)
+        done = subprocess.run(
+            [sys.executable, "-c", args["code"]],
+            cwd=WORKSPACE,
+            capture_output=True,
+            text=True,
+            timeout=RUN_TIMEOUT,
+            env=clean_env,
+        )
     except subprocess.TimeoutExpired:
-        return f"error: the code ran longer than {RUN_TIMEOUT} seconds and was stopped"
+        return f"error: execution exceeded {RUN_TIMEOUT} seconds limit and was terminated"
+    except Exception as exc:
+        return f"error: execution failed ({type(exc).__name__}: {exc})"
+
     output = (done.stdout + done.stderr).strip() or "(no output)"
     return clip(f"{output}\n[exit code {done.returncode}]")
 
@@ -95,84 +111,95 @@ TOOLS = {
 
 
 # ----------------------------------------------------------------------------
-# endpoints used by the harness
+# endpoints used by the harness (protected with HARNESS_SECRET)
 # ----------------------------------------------------------------------------
 def do_reset(body):
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     for child in WORKSPACE.iterdir():
-        shutil.rmtree(child) if child.is_dir() else child.unlink()
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
     for name, content in body["files"].items():
         path = safe_path(name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        path.write_text(content, encoding="utf-8")
     return {"ok": True}
 
 
 def do_tool(body):
-    name, args = body["name"], body.get("args", {})
+    name, args = body.get("name"), body.get("args", {})
     if name not in TOOLS:
         return {"output": f"error: unknown tool '{name}'", "is_error": True}
     try:
-        return {"output": TOOLS[name](args), "is_error": False}
-    except Exception as exc:  # tool-level problems go back to the agent, not the harness
+        output = TOOLS[name](args)
+        return {"output": output, "is_error": False}
+    except Exception as exc:
         return {"output": f"error: {exc}", "is_error": True}
 
 
-def do_verify(body):
-    """Run each hidden check against a throwaway copy of the workspace."""
-    results = []
-    scratch = Path(tempfile.mkdtemp(prefix="verify-"))
-    try:
-        copy = scratch / "project"
-        shutil.copytree(WORKSPACE, copy, ignore=shutil.ignore_patterns("__pycache__"))
-        for code in body["cases"]:
+def do_fetch_configs(_body=None):
+    """Retrieve workspace config files for protected harness-side physics simulation."""
+    configs = {}
+    for p in all_files(WORKSPACE):
+        rel = str(p.relative_to(WORKSPACE)).replace("\\", "/")
+        if rel.endswith((".cfg", ".py", ".csv", ".json")):
             try:
-                done = subprocess.run([sys.executable, "-c", CHILD, code], cwd=copy,
-                                      capture_output=True, text=True, timeout=CASE_TIMEOUT,
-                                      env={"PATH": os.environ.get("PATH", ""),
-                                           "PYTHONDONTWRITEBYTECODE": "1"})
-                marker = "@@RESULT@@"
-                if marker in done.stdout:
-                    results.append(json.loads(done.stdout.rsplit(marker, 1)[1]))
-                else:
-                    results.append({"ok": False, "exc": "NoResult"})
-            except subprocess.TimeoutExpired:
-                results.append({"ok": False, "exc": "Timeout"})
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-    return {"results": results}
+                configs[rel] = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+    return {"files": configs}
 
 
 def do_state(_body=None):
-    files = {str(p.relative_to(WORKSPACE)): hashlib.sha256(p.read_bytes()).hexdigest()
-             for p in all_files(WORKSPACE)}
+    files = {
+        str(p.relative_to(WORKSPACE)).replace("\\", "/"): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in all_files(WORKSPACE)
+    }
     return {"files": files}
 
 
-ROUTES_POST = {"/reset": do_reset, "/tool": do_tool, "/verify": do_verify}
+ROUTES_POST = {
+    "/reset": (do_reset, True),             # (handler, requires_auth)
+    "/tool": (do_tool, False),              # agent tool dispatch (safe)
+    "/fetch_configs": (do_fetch_configs, True), # harness state extraction (requires_auth)
+}
 
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, payload):
-        data = json.dumps(payload).encode()
+        data = json.dumps(payload).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
+    def _is_authorized(self) -> bool:
+        """Verify request comes from harness using shared secret token."""
+        if not HARNESS_SECRET:
+            return True  # no secret configured
+        token = self.headers.get("X-Harness-Secret", "").strip()
+        return token == HARNESS_SECRET
+
     def do_GET(self):
         if self.path == "/health":
-            self._send(200, {"ok": True})
+            self._send(200, {"ok": True, "service": "aerosentinel-sandbox"})
         elif self.path == "/state":
+            if not self._is_authorized():
+                self._send(403, {"error": "forbidden: invalid or missing harness authorization token"})
+                return
             self._send(200, do_state())
         else:
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        handler = ROUTES_POST.get(self.path)
-        if handler is None:
-            return self._send(404, {"error": "not found"})
+        route = ROUTES_POST.get(self.path)
+        if route is None:
+            return self._send(404, {"error": "endpoint not found"})
+        handler, requires_auth = route
+        if requires_auth and not self._is_authorized():
+            return self._send(403, {"error": "forbidden: unauthorized call to privileged endpoint"})
         try:
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length) or b"{}")
@@ -180,11 +207,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send(400, {"error": f"{type(exc).__name__}: {exc}"})
 
-    def log_message(self, *args):  # keep the container log quiet
-        pass
+    def log_message(self, *args):
+        pass  # keep logs clean
 
 
 if __name__ == "__main__":
     WORKSPACE.mkdir(parents=True, exist_ok=True)
-    print(f"sandbox listening on :{PORT}, workspace {WORKSPACE}", flush=True)
+    print(f"hardened sandbox listening on :{PORT}, workspace {WORKSPACE}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

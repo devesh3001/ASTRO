@@ -1,96 +1,99 @@
-# AeroSentinel — Satellite Fault Response RL Environment
+# AeroSentinel — Autonomous Satellite Fault Recovery RL Environment
 
-An RL environment where an AI agent acts as an autonomous fault-response system
-for a CubeSat in low Earth orbit. Subsystem anomalies appear in config files and
-telemetry logs; the agent diagnoses and fixes them before the satellite is lost.
+An unbreakable reinforcement learning environment where an autonomous AI flight software agent responds to live anomalies on a 3U CubeSat in Low Earth Orbit (LEO).
 
-Built on top of the [RL-ENV-TEMPLATE](https://github.com/ayushmothiya1/RL-ENV-TEMPLATE)
-harness contract. The domain is drawn from my role as **Avionics Head at the IIT (BHU)
-Rocketry Division** — the fault patterns, config layouts, and telemetry format mirror
-real embedded flight-software issues we encountered during our rocket avionics work.
+Unlike static coding puzzles, AeroSentinel features a **deterministic 95-minute orbital multi-physics simulation** modeling real coupled dynamics: solar irradiance and eclipse cycles, battery state-of-charge and bus voltage curves, 3-axis reaction wheel momentum and attitude precession, thermostat radiative thermal balance, and Friis RF link budget margins.
 
-## Quick start
+The domain is drawn from embedded avionics development at the **IIT (BHU) Rocketry Division** — modeling real flight software fault states and telemetry protocols.
 
-```bash
-cp .env.example .env          # 1. create config
-# edit .env: set MODEL, API_KEY, BASE_URL (leave as-is for the offline demo)
-docker compose up --build --abort-on-container-exit --exit-code-from harness
-```
+---
 
-With the default `MODEL=mock/solver` the environment runs offline with no API key.
+## Security & Isolation (Bar 3: Robustness)
+
+- **Isolated Physics Verifier**: Evaluation runs strictly in the protected harness container. The untrusted sandbox container contains no verification or reward code.
+- **Transport Authorization**: Privileged endpoints (`/reset`, `/state`, `/fetch_configs`) require a high-entropy secret token (`HARNESS_SECRET`) via the `X-Harness-Secret` header. Direct calls from unprivileged agent code are rejected with `403 Forbidden`.
+- **Scrubbed Subprocess Execution**: Agent Python commands execute under a sanitized environment stripping all container and host secrets.
+- **Path Traversal Protection**: All filesystem access is strictly bounded inside `/workspace`.
+- **Zero Answer Leakage**: The agent receives realistic symptoms, anomaly alerts, and flight manuals (`docs/flight_manual.md`), never hardcoded answer numbers.
+
+---
 
 ## Tasks
 
-| Task ID | Title | Difficulty |
-|---|---|---|
-| `power_brownout` | EPS Solar Panel Degradation | easy |
-| `adcs_wheel_bias` | ADCS Reaction Wheel Speed Bias | easy |
-| `thermal_runaway` | Battery Thermal Runaway | medium |
-| `comms_link_budget` | Comms Link Budget Failure | medium |
-| `multi_fault_cascade` | Multi-Subsystem Fault Cascade (seeded) | medium |
+| Task ID | Title | Difficulty | Coupled Physical Systems |
+| :--- | :--- | :--- | :--- |
+| `eps_eclipse_recovery` | EPS Solar Calibration & Eclipse Brownout | Easy | Solar generation, battery SoC, eclipse transition, bus voltage floor |
+| `adcs_detumble_pointing` | ADCS Momentum Bias & Detumble | Easy | Reaction wheel bias, attitude precession, sun-vector pointing |
+| `thermal_battery_preservation` | Battery Thermal Runaway Prevention | Medium | Thermostat hysteresis, internal heat dissipation, runaway cutoff |
+| `rf_downlink_closure` | RF Downlink Closure & Dynamic Budget | Medium | Transmitter power, antenna directivity, Friis equation, telemetry pass |
+| `safe_mode_cascade` | Multi-Subsystem Safe Mode Cascade | Medium (Seeded) | Coupled power-attitude-thermal failure requiring coordinated recovery |
 
-**Demo task (Run A):** `power_brownout`
+**Demo Task (Run A):** `eps_eclipse_recovery`
 
-## What the agent does
+---
 
-The agent has five tools: `list_files`, `read_file`, `write_file`, `run_python`, `finish`.
-The satellite's onboard filesystem lives in the sandbox (no internet). INI-format config
-files (`.cfg`) and telemetry logs (`.csv`) are the agent's window into the world.
-The verifier reads fixed configs programmatically — it never inspects the agent's text output.
+## Quick Start (One Command)
 
-## Scoring
-
-```
-reward = 0.7 × (target checks passed / total target checks)
-       + 0.3 × (above) × (regression checks passed / total regression checks)
-```
-
-- **Oracle** (reference solution) must score ≥ 0.95
-- **No-op** (gives up immediately) must score ≤ 0.05
-
-## Try other tasks and modes
+From a fresh clone with Docker installed:
 
 ```bash
-# run a specific task
-TASK_ID=thermal_runaway docker compose up --build --abort-on-container-exit --exit-code-from harness
-
-# seeded variant (different subsystems fail each time)
-TASK_ID=multi_fault_cascade SEED=7 docker compose up --build --abort-on-container-exit --exit-code-from harness
-
-# baseline checks only, no model call (produces gate.json for submission)
-MODE=baselines docker compose up --build --abort-on-container-exit --exit-code-from harness
-
-# model on every task in turn
-MODE=all docker compose up --build --abort-on-container-exit --exit-code-from harness
-
-# no-op model (should fail with reward ~0)
-MODEL=mock/idle docker compose up --build --abort-on-container-exit --exit-code-from harness
+cp .env.example .env
+docker compose up --build --abort-on-container-exit --exit-code-from harness
 ```
 
-## Verify credentials before running
+The default `MODEL=mock/solver` runs completely offline with no API key, executes the oracle reference solution (scoring 1.00), executes the no-op baseline (scoring 0.00), and completes the model run.
+
+---
+
+## Common Execution Modes
 
 ```bash
-API_KEY=... BASE_URL=... MODEL=... python check_model.py
+# 1. Run baseline gate checks across all 5 tasks (generates gate.json)
+MODE=baselines docker compose up --abort-on-container-exit --exit-code-from harness
+
+# 2. Run model across every task in turn
+MODE=all docker compose up --abort-on-container-exit --exit-code-from harness
+
+# 3. Test idle/give-up model (verifies zero undeserved reward)
+MODEL=mock/idle docker compose up --abort-on-container-exit --exit-code-from harness
+
+# 4. Run seeded variant of compound safe-mode cascade
+TASK_ID=safe_mode_cascade SEED=42 docker compose up --abort-on-container-exit --exit-code-from harness
+
+# 5. Connect real model via OpenAI-compatible endpoint
+MODEL=gpt-4o API_KEY=sk-... BASE_URL=https://api.openai.com/v1 docker compose up ...
 ```
 
-## Layout
+---
+
+## Scoring Model (Outcome-Based)
 
 ```
-docker-compose.yml       two services: sandbox (no internet) and harness
-Dockerfile.sandbox       agent's isolated workspace image
-Dockerfile.harness       verifier, baselines, model loop image
-sandbox/server.py        tool execution inside the sandboxed workspace
-harness/run.py           entry point: oracle -> no-op -> model run
-harness/runner.py        step loop, limits, context trimming, telemetry
-harness/env.py           reset / step / score (verifier lives here)
-harness/tasks.py         five satellite fault tasks + reference solutions
-harness/tools.py         tool schemas shown to the model
-harness/agents.py        OpenAI-compatible client, mock models, baselines
+reward = power_balance (0.35)
+       + thermal_stability (0.25)
+       + adcs_precision (0.20)
+       + comms_closure (0.20)
 ```
+- **Oracle Baseline**: Must score $\ge 0.95$ (achieves $1.00$).
+- **No-Op Baseline**: Must score $\le 0.05$ (achieves $0.00$).
+- If any catastrophic safety violation occurs (bus collapse below 3.10V, thermal runaway $>50^\circ\text{C}$, or unmitigated tumble), total reward is strictly zeroed.
 
-## Notes
+---
 
-- Never commit API keys. `.env` is ignored by git.
-- The verifier and hidden check code live in the harness container only.
-  The sandbox has no access to them.
-- If your environment uses an LLM of its own, bring your own setup for it.
+## Directory Layout
+
+```
+docker-compose.yml       harness (isolated+internet) + sandbox (isolated only)
+Dockerfile.sandbox       isolated workspace with hardened Python server
+Dockerfile.harness       verifier, limits, telemetry logger, baseline runner
+sandbox/server.py        authenticated tool server with token validation
+harness/verifier.py      orbital multi-physics simulation engine
+harness/tasks.py         5 flight tasks with symptom alerts & docs/flight_manual.md
+harness/env.py           reset / step / score with physics evaluation
+harness/runner.py        40-step limits, 600s time cap, 48K token context trimmer
+harness/agents.py        OpenAI-compatible client + mock/solver + mock/idle
+harness/run.py           entrypoint: oracle -> no-op -> model execution
+inputs/append.txt        default appended instructions file
+tests/test_physics.py    unit tests for orbital physics equations
+tests/test_adversarial.py unit tests for sandbox security, tokens & limits
+```

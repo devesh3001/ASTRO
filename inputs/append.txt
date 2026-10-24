@@ -1,0 +1,3 @@
+# Default appended instructions for AeroSentinel evaluation
+# In Run B, judges provide an instructions file here.
+Explain your engineering hypothesis before applying parameter updates.
