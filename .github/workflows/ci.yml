@@ -1,54 +1,40 @@
 name: AeroSentinel CI
-
 on:
   push:
-    branches: [main]
+    branches: [main, 'codex/**']
   pull_request:
     branches: [main]
-
 jobs:
   test:
-    name: Physics Validation & Security Defenses
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+    timeout-minutes: 20
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run Deterministic Orbital Physics Validation
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Install verified runtime dependencies
+        run: pip install --require-hashes -r requirements.lock
+      - name: Baseline integration and regression tests
         run: |
           python tests/test_physics.py
-
-      - name: Run Adversarial Security & Isolation Suite
-        run: |
-          python tests/test_adversarial.py
-
-      - name: Run Extended 100-Seed Suite Across All 5 Tasks
-        run: |
-          python -m unittest tests/test_seeds_extended.py
-
-      - name: Build Docker Services
-        run: |
-          docker compose build
-
-      - name: Run Baselines Gate in Isolated Containers
-        run: |
-          MODE=baselines docker compose up --abort-on-container-exit --exit-code-from harness
-
-      - name: Run Live Docker Security & Privilege Separation Suite
+          python -m unittest tests.test_adversarial tests.test_hardening tests.test_packaging tests.test_seeds_extended
+      - name: Measure isolated cold build
+        run: python scripts/check_cold_build.py
+      - name: Run all-task gates and offline solver
+        run: MODE=all MODEL=mock/solver docker compose up --build --abort-on-container-exit --exit-code-from harness
+      - name: Run live isolation and process/resource regressions
         run: |
           docker compose up -d sandbox
-          docker compose run --rm -v "${PWD}/tests:/app/tests" -e FAIL_ON_UNAVAILABLE=1 -e SANDBOX_URL=http://sandbox:8000 harness python -m unittest tests.test_docker_security
-          docker compose down
+          docker compose run --rm -v "${PWD}/tests:/app/tests:ro" -e FAIL_ON_UNAVAILABLE=1 harness python -m unittest tests.test_docker_security
+      - name: Stop containers
+        if: always()
+        run: docker compose down --volumes
+      - name: Preserve validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aerosentinel-validation
+          path: logs/

@@ -1,17 +1,10 @@
-# Hardened sandbox: isolated execution with privilege separation
-FROM python:3.12-slim
-
-# Create separate service account (UID 1000), agent execution account (UID 1001), and isolated verifier worker (UID 1002)
-RUN groupadd -g 1000 srvgroup && useradd -u 1000 -g srvgroup -m sandbox-server \
- && groupadd -g 1001 agentgroup && useradd -u 1001 -g agentgroup -m sandbox-agent \
- && groupadd -g 1002 evalgroup && useradd -u 1002 -g evalgroup -m sandbox-eval \
- && mkdir -p /workspace && chown sandbox-agent:agentgroup /workspace && chmod 777 /workspace \
- && mkdir -p /run/aerosentinel && chmod 700 /run/aerosentinel
-
-COPY sandbox/server.py /opt/sandbox/server.py
-WORKDIR /workspace
-ENV PYTHONUNBUFFERED=1
+# Separate runtime identities; the verifier is never copied into this image.
+FROM python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704
+RUN groupadd -g 1001 agentgroup && useradd -u 1001 -g agentgroup -M sandbox-agent \
+ && groupadd -g 1002 evalgroup && useradd -u 1002 -g evalgroup -M sandbox-eval \
+ && mkdir -p /workspace /run/aerosentinel && chmod 700 /run/aerosentinel
+COPY sandbox /opt/sandbox
+WORKDIR /opt
+ENV PYTHONUNBUFFERED=1 REQUIRE_SANDBOX_USERS=1
 EXPOSE 8000
-
-# Runs as root so it can spawn untrusted agent code as UID 1001 (sandbox-agent)
-CMD ["python", "/opt/sandbox/server.py"]
+CMD ["python", "-m", "sandbox.server"]

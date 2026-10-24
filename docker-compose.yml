@@ -8,18 +8,23 @@ name: aerosentinel
 
 services:
   sandbox:                       # where the agent's tools run (no internet)
+    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile.sandbox
     networks: [isolated]         # internal network only: no internet access
     init: true                   # forwards SIGTERM cleanly
     cap_drop: [ALL]
-    cap_add: [SETUID, SETGID, CHOWN, DAC_OVERRIDE, FOWNER]  # allows privilege separation and workspace management
-    security_opt: ["no-new-privileges:false"]
-    pids_limit: 256
+    cap_add: [SETUID, SETGID, CHOWN, DAC_OVERRIDE, FOWNER, KILL]  # allows privilege separation and workspace management
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    cpus: 1.0
+    read_only: true
+    tmpfs:
+      - /workspace:size=12m,nr_inodes=1024,mode=0755
+      - /tmp:size=16m,nr_inodes=1024,mode=1777
     mem_limit: 512m
     environment:
-      HARNESS_SECRET: ${HARNESS_SECRET:-}
       WORKSPACE_DIR: /workspace
       PORT: 8000
     volumes:
@@ -31,6 +36,7 @@ services:
       retries: 30
 
   harness:                       # verifier, baselines and model loop
+    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile.harness
@@ -48,14 +54,13 @@ services:
       MODE: ${MODE:-full}
       APPEND_FILE: ${APPEND_FILE:-}
       SANDBOX_URL: http://sandbox:8000
-      HARNESS_SECRET: ${HARNESS_SECRET:-}
     volumes:
       - auth_tokens:/run/aerosentinel:ro
       - ./logs:/app/logs
       - ./inputs:/app/inputs:ro
 
 volumes:
-  auth_tokens:                   # private in-memory communication volume for dynamic auth token
+  auth_tokens:                   # private persistent volume; token rotates on service startup
 
 networks:
   isolated:

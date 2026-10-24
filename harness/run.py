@@ -15,6 +15,8 @@ import json
 import os
 import sys
 import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -52,13 +54,17 @@ def run_gate(env, task_ids, seed, log_path):
     print("\n== Checks before the model run ==", flush=True)
     for task_id in task_ids:
         task = build_task(task_id, seed)
-        oracle = run_scripted(env, task_id, seed, oracle_actions(task), "oracle", log)["total"]
-        noop = run_scripted(env, task_id, seed, noop_actions(task), "noop", log)["total"]
-        row = {"task": task_id, "difficulty": task.difficulty, "oracle": oracle, "noop": noop,
-               "oracle_ok": oracle >= ORACLE_MIN, "noop_ok": noop <= NOOP_MAX}
+        try:
+            with env.budget(GATE_BUDGET_SECONDS):
+                oracle = run_scripted(env, task_id, seed, oracle_actions(task), "oracle", log)["total"]
+                noop = run_scripted(env, task_id, seed, noop_actions(task), "noop", log)["total"]
+            row = {"task": task_id, "difficulty": task.difficulty, "oracle": oracle, "noop": noop,
+                   "oracle_ok": oracle >= ORACLE_MIN, "noop_ok": noop <= NOOP_MAX}
+        except Exception as exc:
+            row = {"task": task_id, "oracle": None, "noop": None, "oracle_ok": False,
+                   "noop_ok": False, "error": f"{type(exc).__name__}: {exc}"}
         rows.append(row)
-        print(f"{task_id:<22} oracle {oracle:.2f} {'PASS' if row['oracle_ok'] else 'FAIL'}   "
-              f"no-op {noop:.2f} {'PASS' if row['noop_ok'] else 'FAIL'}", flush=True)
+        print(f"{task_id}: {json.dumps(row)}", flush=True)
     log.close()
     return all(r["oracle_ok"] and r["noop_ok"] for r in rows), rows
 
@@ -86,7 +92,7 @@ def load_append(name):
             raise ValueError(f"APPEND_FILE inputs/{name} not found; put the file in the inputs/ folder")
         return "", None
     try:
-        text = path.read_bytes().decode("utf-8-sig")
+        text = path.read_bytes().decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError(f"APPEND_FILE inputs/{name} is not UTF-8 text ({exc.reason})")
     if not text.strip():
@@ -103,7 +109,7 @@ def main():
     model, api_key, base_url = setting("MODEL", "mock/solver"), setting("API_KEY"), setting("BASE_URL") or None
     task_id, mode = setting("TASK_ID", DEMO_TASK), setting("MODE", "full")
     seed = int(setting("SEED", "0"))
-    run_id = time.strftime("%Y%m%d-%H%M%S")
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S-%fZ") + "-" + uuid.uuid4().hex[:8]
     out = Path("logs") / run_id
     out.mkdir(parents=True, exist_ok=True)
     limits = Limits(max_steps=int(setting("MAX_STEPS", "40")), max_seconds=int(setting("MAX_SECONDS", "600")))
@@ -137,6 +143,12 @@ def main():
     except RuntimeError as exc:
         print(f"error: {exc}", flush=True)
         return 1
+    source_files = sorted(Path(__file__).parent.glob("*.py"))
+    source_hash = hashlib.sha256(b"".join(p.name.encode() + p.read_bytes().replace(b"\r\n", b"\n") for p in source_files)).hexdigest()
+    sandbox_build = requests.get(url + "/health", timeout=5).json().get("build_sha256")
+    manifest = {"contract_version": 2, "harness_sha256": source_hash,
+                "sandbox_sha256": sandbox_build, "model": model, "seed": seed, "mode": mode}
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     env = Env(url)
     task_ids = [task_id] if mode == "full" else list(TASKS)
     gate_started = time.monotonic()
@@ -144,7 +156,8 @@ def main():
     gate_seconds = round(time.monotonic() - gate_started, 2)
     print(f"checks took {gate_seconds}s", flush=True)
     if mode == "full" and gate_seconds > GATE_BUDGET_SECONDS:
-        print(f"WARNING: checks exceeded the {GATE_BUDGET_SECONDS}s budget for the live run", flush=True)
+        print(f"checks exceeded the {GATE_BUDGET_SECONDS}s budget; model blocked", flush=True)
+        passed = False
     (out / "gate.json").write_text(json.dumps(
         {"seed": seed, "passed": passed, "gate_seconds": gate_seconds, "tasks": rows}, indent=2))
 

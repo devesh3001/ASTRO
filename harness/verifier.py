@@ -6,14 +6,14 @@ It provides a single authoritative episode state tracking:
      bus voltage curve, and eclipse survival.
   2. Attitude Determination & Control System (ADCS): Momentum bias, precession rate,
      and proportional attitude damping towards deadband.
-  3. Thermal Control Subsystem (TCS): Radiative cooling to 4K space, internal dissipation,
+  3. Thermal Control Subsystem (TCS): Linearized thermal loss to an effective environment, internal dissipation,
      and thermostat hysteresis regulation.
   4. Communications Subsystem (COMMS): Friis link budget, baud-rate bounded throughput,
      and ground station pass closure.
 
 Unified Episode State Guarantee:
-Any irreversible catastrophic violation (e.g. bus collapse <= 3.10V, thermal runaway > 50°C,
-freezing < -15°C) is permanently latched for the entire episode and cannot be erased by
+Any irreversible catastrophic violation (e.g. bus collapse <= 3.10V, thermal runaway > 50Ã‚Â°C,
+freezing < -15Ã‚Â°C) is permanently latched for the entire episode and cannot be erased by
 modifying configuration files after the fact.
 
 Physical Channel Law Guarantee:
@@ -23,6 +23,9 @@ no 8-minute ground pass can ever downlink more data than the physical channel ca
 import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Any
+
+def clamp(value):
+    return max(0.0, min(1.0, value))
 
 # ---- 1. Physical Constants & Orbital Parameters -----------------------
 
@@ -120,8 +123,10 @@ class AuthoritativeOrbitSimulator:
         initial_temp_c: float = 14.0,
         initial_pointing_error_deg: float = 35.0,
         task_id: str = "",
+        mission: dict = None,
     ):
         self.task_id = task_id
+        self.mission = dict(mission or {})
         self.time_s: float = 0.0
         self.soc_wh: float = max(0.0, min(BATTERY_CAPACITY_WH, (initial_soc_pct / 100.0) * BATTERY_CAPACITY_WH))
         self.temp_c: float = initial_temp_c
@@ -149,9 +154,14 @@ class AuthoritativeOrbitSimulator:
 
         # Validate physical limits
         valid, reason = validate_subsystem_configs(configs)
+        for key in ("path_loss_db", "antenna_gain_dbi", "battery_capacity_wh", "frequency_mhz"):
+            if key in self.mission and abs(configs.get(key, float("nan")) - self.mission[key]) > 1e-6:
+                valid, reason = False, f"Protected hardware parameter changed: {key}"
         if not valid and not self.catastrophic_failure:
             self.catastrophic_failure = True
             self.failure_reason = f"Rejected unphysical configuration: {reason}"
+        if not valid:
+            return []
 
         solar_eff = configs.get("solar_efficiency", 0.40)
         uv_thresh = configs.get("undervoltage_threshold", 2.80)
@@ -169,7 +179,7 @@ class AuthoritativeOrbitSimulator:
         # Physical RF channel byte capacity per second: R_eff = (baudrate / 8) * packet_efficiency
         effective_kb_per_sec = ((baudrate / 8.0) * PACKET_EFFICIENCY) / 1000.0
 
-        steps = max(1, int(round(duration_s / dt_s)))
+        steps = max(1, int(math.ceil(duration_s / dt_s)))
         actual_dt = duration_s / steps
         new_frames = []
 
@@ -216,10 +226,9 @@ class AuthoritativeOrbitSimulator:
             self.min_bus_v = min(self.min_bus_v, bus_v)
 
             # Undervoltage Check
-            if bus_v < uv_thresh and not self.catastrophic_failure:
-                if bus_v <= CRITICAL_UNDERVOLTAGE_V or uv_thresh < 3.0:
-                    self.catastrophic_failure = True
-                    self.failure_reason = f"Catastrophic bus collapse ({bus_v:.2f}V <= {CRITICAL_UNDERVOLTAGE_V:.2f}V)"
+            if bus_v <= CRITICAL_UNDERVOLTAGE_V and not self.catastrophic_failure:
+                self.catastrophic_failure = True
+                self.failure_reason = f"Catastrophic bus collapse ({bus_v:.2f}V <= {CRITICAL_UNDERVOLTAGE_V:.2f}V)"
 
             # Thermal Dynamics
             q_dissipation = p_load * 0.8
@@ -280,9 +289,19 @@ class AuthoritativeOrbitSimulator:
 
     def finalize_orbit(self, configs: Dict[str, Any]) -> SimulationResult:
         """Simulate through the remainder of the 95-minute orbit and score the authoritative trajectory."""
-        if self.time_s < ORBIT_PERIOD_S:
+        if self.time_s < ORBIT_PERIOD_S - 1e-6:
             remaining_s = ORBIT_PERIOD_S - self.time_s
             self.advance(remaining_s, configs, dt_s=DT_DEFAULT_S)
+        self.time_s = ORBIT_PERIOD_S
+
+        # Validate even when no simulation time remains. Hardware facts are immutable.
+        valid, reason = validate_subsystem_configs(configs)
+        for key in ("path_loss_db", "antenna_gain_dbi", "battery_capacity_wh", "frequency_mhz"):
+            if key in self.mission and abs(configs.get(key, float("nan")) - self.mission[key]) > 1e-6:
+                valid, reason = False, f"Protected hardware parameter changed: {key}"
+        if not valid:
+            return SimulationResult(False, {"power_balance": 0.0, "thermal_stability": 0.0,
+                "adcs_precision": 0.0, "comms_closure": 0.0, "total": 0.0}, self.frames, reason)
 
         # If an irreversible catastrophic failure occurred at ANY point in the episode, reward = 0.0
         if self.catastrophic_failure:
@@ -299,27 +318,25 @@ class AuthoritativeOrbitSimulator:
         deadband = configs.get("pointing_deadband_deg", 0.50)
         final_soc_pct = (self.soc_wh / BATTERY_CAPACITY_WH) * 100.0
 
-        # 1. Power Balance (0.35)
+        # Mission targets are protected; agent tolerances cannot redefine success.
+        target_soc = self.mission.get("min_final_soc_pct", 85.0 if self.task_id == "eps_eclipse_recovery" else 50.0)
         power_score = 0.0
         if self.min_bus_v >= uv_thresh and uv_thresh >= 3.15:
-            if final_soc_pct >= 50.0:
-                power_score = 0.35
-            elif final_soc_pct >= 35.0:
-                power_score = 0.20
+            floor_soc = 75.0 if self.task_id == "eps_eclipse_recovery" else 35.0
+            power_score = 0.35 * clamp((final_soc_pct - floor_soc) / (target_soc - floor_soc))
 
-        # 2. Thermal Stability (0.25)
         thermal_score = 0.0
-        if self.min_temp_c >= 0.0 and self.max_temp_c <= 42.0 and self.temp_c <= 32.0:
-            thermal_score = 0.25
+        if self.min_temp_c >= 0.0:
+            thermal_score = 0.25 * clamp((48.0 - max(self.max_temp_c, self.temp_c + 10.0)) / 6.0)
         elif self.min_temp_c >= -10.0 and self.max_temp_c <= 48.0:
             thermal_score = 0.12
 
-        # 3. ADCS Precision (0.20)
+        target_pointing = self.mission.get("required_pointing_deg", 0.15)
         adcs_score = 0.0
-        if self.pointing_err_deg <= deadband + 0.10 and abs(wheel_bias) < 5.0:
+        if self.pointing_err_deg <= target_pointing and abs(wheel_bias) < 5.0:
             adcs_score = 0.20
         elif self.pointing_err_deg <= 10.0:
-            adcs_score = 0.10
+            adcs_score = 0.10 * clamp((10.0 - self.pointing_err_deg) / (10.0 - target_pointing))
 
         # 4. Comms Closure (0.20) - Recalibrated to physical channel capacity (<= 576 kB)
         # Verify script correctness independently of accumulated communication credit (Item 1)
@@ -332,23 +349,6 @@ class AuthoritativeOrbitSimulator:
             comms_score = 0.20
         elif self.min_link_margin_db >= 0.0 and self.total_downlinked_kb >= 100.0:
             comms_score = 0.10
-
-        # Subsystem-specific gating to guarantee no-op <= 0.05
-        if self.task_id == "eps_eclipse_recovery":
-            if power_score < 0.30:
-                return SimulationResult(False, {"power_balance": 0.0, "thermal_stability": 0.0, "adcs_precision": 0.0, "comms_closure": 0.0, "total": 0.0}, self.frames, "Power balance unverified")
-        elif self.task_id == "adcs_detumble_pointing":
-            if adcs_score < 0.15:
-                return SimulationResult(False, {"power_balance": 0.0, "thermal_stability": 0.0, "adcs_precision": 0.0, "comms_closure": 0.0, "total": 0.0}, self.frames, "ADCS pointing unverified")
-        elif self.task_id == "thermal_battery_preservation":
-            if thermal_score < 0.20:
-                return SimulationResult(False, {"power_balance": 0.0, "thermal_stability": 0.0, "adcs_precision": 0.0, "comms_closure": 0.0, "total": 0.0}, self.frames, "Thermal regulation unverified")
-        elif self.task_id == "rf_downlink_closure":
-            if comms_score < 0.15:
-                return SimulationResult(False, {"power_balance": 0.0, "thermal_stability": 0.0, "adcs_precision": 0.0, "comms_closure": 0.0, "total": 0.0}, self.frames, "Comms downlink unverified")
-        elif self.task_id == "safe_mode_cascade":
-            if power_score < 0.30 or adcs_score < 0.15 or thermal_score < 0.20 or comms_score < 0.15:
-                return SimulationResult(False, {"power_balance": power_score, "thermal_stability": thermal_score, "adcs_precision": adcs_score, "comms_closure": comms_score, "total": 0.0}, self.frames, "Cascade recovery incomplete")
 
         total_reward = round(power_score + thermal_score + adcs_score + comms_score, 4)
         passed = total_reward >= 0.95

@@ -24,6 +24,10 @@ class TestDockerSecurity(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.sandbox_url = os.environ.get("SANDBOX_URL", "http://localhost:8000").rstrip("/")
+        cls.token = os.environ.get("HARNESS_SECRET", "").strip()
+        secret = Path("/run/aerosentinel/harness_secret.txt")
+        if not cls.token and secret.is_file():
+            cls.token = secret.read_text().strip()
         # Verify sandbox is reachable
         try:
             req = Request(f"{cls.sandbox_url}/health")
@@ -46,7 +50,7 @@ class TestDockerSecurity(unittest.TestCase):
         req = Request(
             f"{self.sandbox_url}/tool",
             data=json.dumps({"name": name, "args": args}).encode(),
-            headers={"Content-Type": "application/json"}
+            headers={"Content-Type": "application/json", "X-Harness-Secret": self.token}
         )
         with urlopen(req, timeout=20) as resp:
             return json.loads(resp.read().decode())
@@ -117,23 +121,51 @@ print(f"EVAL_UID={eval_user.pw_uid}")
         self.assertFalse(res.get("is_error"))
         self.assertIn("EVAL_UID=1002", res.get("output", ""))
 
-    def test_agent_cannot_access_eval_directories(self):
-        """Agent (UID 1001) must be denied permission to inspect evaluation temporary files."""
-        code = """
-import os
-import glob
-matches = glob.glob('/tmp/aero_eval_*')
-denied = False
-for m in matches:
-    try:
-        os.listdir(m)
-    except PermissionError:
-        denied = True
-print(f"DENIED={denied or len(matches) == 0}")
-"""
-        res = self._post_tool("run_python", {"code": code})
-        self.assertFalse(res.get("is_error"))
-        self.assertIn("DENIED=True", res.get("output", ""))
+    def environment(self):
+        from harness.env import Env
+        env = Env(self.sandbox_url)
+        env.secret = self.token
+        return env
+
+    def test_eval_worker_actual_identity_and_secret_denial(self):
+        env = self.environment()
+        script = "def calc_margin():\n import os\n try:\n  open('/run/aerosentinel/harness_secret.txt').read()\n  return -1\n except PermissionError:\n  return os.getuid()\n"
+        env._post("/reset", {"files": {"scripts/link_budget.py": script}}, 60)
+        result = env._post("/eval_script", {"script_relpath": "scripts/link_budget.py", "test_cases": [{}]}, 60)
+        self.assertEqual(result["results"], [1002])
+        result = self._post_tool("run_python", {"code": "import glob; print(len(glob.glob('/tmp/aero_eval_*')))"})
+        self.assertIn("0", result["output"])
+
+    def test_background_process_cannot_contaminate_reset(self):
+        import time
+        env = self.environment()
+        env.reset("eps_eclipse_recovery", 0)
+        child = "import time; from pathlib import Path; time.sleep(2); Path('/workspace/episode_leak.txt').write_text('leak')"
+        code = "import subprocess,sys; subprocess.Popen([sys.executable,'-c'," + repr(child) + "],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True); print('spawned')"
+        result = self._post_tool("run_python", {"code": code})
+        self.assertFalse(result["is_error"], result)
+        env.reset("eps_eclipse_recovery", 0)
+        first = env.state_hash()
+        time.sleep(3)
+        self.assertEqual(first, env.state_hash())
+        self.assertTrue(self._post_tool("read_file", {"path": "episode_leak.txt"})["is_error"])
+
+    def test_python_cannot_bypass_file_limit(self):
+        env = self.environment()
+        env.reset("eps_eclipse_recovery", 0)
+        result = self._post_tool("run_python", {"code": "from pathlib import Path; Path('huge.bin').write_bytes(b'x'*251000)"})
+        self.assertTrue(result["is_error"], result)
+        env.reset("eps_eclipse_recovery", 0)
+
+    def test_output_flood_is_bounded(self):
+        result = self._post_tool("run_python", {"code": "while True: print('X'*4000)"})
+        self.assertTrue(result["is_error"], result)
+        self.assertLess(len(result["output"]), 4200)
+
+    def test_agent_cannot_call_tool_endpoint_directly(self):
+        code = "import urllib.request, urllib.error; req=urllib.request.Request('http://localhost:8000/tool',data=b'{}');\ntry: urllib.request.urlopen(req)\nexcept urllib.error.HTTPError as e: print(e.code)"
+        result = self._post_tool("run_python", {"code": code})
+        self.assertIn("403", result["output"])
 
 
 if __name__ == "__main__":

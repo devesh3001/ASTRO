@@ -1,100 +1,102 @@
-# AeroSentinel — Autonomous Satellite Fault Recovery RL Environment
+# AeroSentinel - Team Astro
 
-An unbreakable reinforcement learning environment where an autonomous AI flight software agent responds to live anomalies on a 3U CubeSat in Low Earth Orbit (LEO).
+A deterministic, simplified CubeSat fault-recovery environment for tool-using language models. Agents repair software configurations; a separate programmatic verifier evaluates mission outcomes. This is an evaluation simulator, not validated flight software.
 
-Unlike static coding puzzles, AeroSentinel features a **deterministic 95-minute orbital multi-physics simulation** modeling real coupled dynamics: solar irradiance and eclipse cycles, battery state-of-charge and bus voltage curves, 3-axis reaction wheel momentum and attitude precession, thermostat radiative thermal balance, and Friis RF link budget margins.
+## Run from a fresh clone
 
-The domain is drawn from embedded avionics development at the **IIT (BHU) Rocketry Division** — modeling real flight software fault states and telemetry protocols.
+Copy `.env.example` to `.env`, fill in model credentials if using a real model, and run:
 
----
-
-## Security & Isolation (Bar 3: Robustness)
-
-- **Isolated Physics Verifier**: Evaluation runs strictly in the protected harness container. The untrusted sandbox container contains zero verification or reward code.
-- **Privilege Separation**: The server runs with dropped capabilities (`cap_drop: [ALL]`), and all agent Python execution (`run_python`) executes strictly under unprivileged account `sandbox-agent` (UID 1001), preventing access to server memory or `/proc/1/environ`.
-- **Dynamic Secret Token Authorization**: Privileged endpoints (`/reset`, `/state`, `/fetch_configs`) require a dynamically generated 256-bit token created at container startup into a root-owned `mode 0600` volume. Unauthenticated calls receive `403 Forbidden`.
-- **Dynamic Behavioural Verification**: Dynamic code testing replaces string matching; scripts such as `link_budget.py` are executed against synthesized test fixtures with varied parameters, preventing comment/substring bypasses.
-- **Interactive Orbital Progression**: Agents can call `step_orbit` to advance orbital time and observe dynamic consequences in `telemetry/live_telemetry.csv` and `telemetry/current_status.json`.
-- **Zero Answer Leakage**: The agent receives realistic symptoms, anomaly alerts, and flight manuals (`docs/flight_manual.md`), never hardcoded answer numbers.
-
----
-
-## Tasks
-
-| Task ID | Title | Difficulty | Coupled Physical Systems |
-| :--- | :--- | :--- | :--- |
-| `eps_eclipse_recovery` | EPS Solar Calibration & Eclipse Brownout | Easy | Solar generation, battery SoC, eclipse transition, bus voltage floor |
-| `adcs_detumble_pointing` | ADCS Momentum Bias & Detumble | Easy | Reaction wheel bias, attitude precession, sun-vector pointing |
-| `thermal_battery_preservation` | Battery Thermal Runaway Prevention | Medium | Thermostat hysteresis, internal heat dissipation, runaway cutoff |
-| `rf_downlink_closure` | RF Downlink Closure & Dynamic Budget | Medium | Transmitter power, antenna directivity, Friis equation, telemetry pass |
-| `safe_mode_cascade` | Multi-Subsystem Safe Mode Cascade | Medium (Seeded) | Coupled power-attitude-thermal failure requiring coordinated recovery |
-
-**Demo Task (Run A):** `eps_eclipse_recovery`
-
----
-
-## Quick Start (One Command)
-
-From a fresh clone with Docker installed:
-
-```bash
-cp .env.example .env
+```sh
 docker compose up --build --abort-on-container-exit --exit-code-from harness
 ```
 
-The default `MODEL=mock/solver` runs completely offline with no API key, executes the oracle reference solution (scoring 1.00), executes the no-op baseline (scoring 0.00), and completes the model run.
+The default `MODEL=mock/solver` runs offline. Both baselines must pass before a model is called. Judges change only `MODEL`, `API_KEY`, `BASE_URL`, `TASK_ID`, optional `SEED`, and `APPEND_FILE`. No provider/model is special-cased.
 
----
+| Task | Difficulty | Goal |
+|---|---|---|
+| `eps_eclipse_recovery` | Easy | Recover generation and meet the instance's eclipse-energy target |
+| `adcs_detumble_pointing` | Easy | Remove momentum bias and meet a protected pointing requirement |
+| `thermal_battery_preservation` | Medium | Recover safe battery temperature regulation |
+| `rf_downlink_closure` | Medium | Restore transmitter settings and repair the dynamic RF calculation |
+| `safe_mode_cascade` | Medium | Recover two seeded subsystem faults without an irreversible safety event |
 
-## Common Execution Modes
+**Run A demo:** `eps_eclipse_recovery`.
 
-```bash
-# 1. Run baseline gate checks across all 5 tasks (generates gate.json)
-MODE=baselines docker compose up --abort-on-container-exit --exit-code-from harness
+The flight manual provides nominal operational guidance. `docs/mission.json` reports instance-specific success targets and fixed hardware properties. Seeds change faults, energy requirements and hardware/link profiles. Agent edits cannot change protected mission metadata.
 
-# 2. Run model across every task in turn
-MODE=all docker compose up --abort-on-container-exit --exit-code-from harness
+## Modes
 
-# 3. Test idle/give-up model (verifies zero undeserved reward)
-MODEL=mock/idle docker compose up --abort-on-container-exit --exit-code-from harness
+Set these values in `.env` (or use shell environment overrides):
 
-# 4. Run seeded variant of compound safe-mode cascade
-TASK_ID=safe_mode_cascade SEED=42 docker compose up --abort-on-container-exit --exit-code-from harness
+- `MODE=full`: baselines then model for `TASK_ID`.
+- `MODE=baselines`: baselines for all five tasks.
+- `MODE=all`: all-task baselines then a model episode for each task.
+- `MODEL=mock/idle`: offline agent that immediately finishes, useful for failure-path checks.
 
-# 5. Connect real model via OpenAI-compatible endpoint
-MODEL=gpt-4o API_KEY=sk-... BASE_URL=https://api.openai.com/v1 docker compose up ...
+`APPEND_FILE` names a UTF-8 file inside `inputs/`. Its decoded text is appended without trimming or newline rewriting and recorded with its hash. An explicitly named missing, unreadable or blank file stops the run.
+
+## State, actions and scoring
+
+State persists within an episode: elapsed orbital time, battery energy, temperature, scalar pointing error and downlinked data. Tools are `list_files`, `read_file`, `write_file`, `run_python`, `step_orbit` (1-30 minutes), and `finish`. Ordinary successful tool execution consumes 30 simulated seconds; the mission window is 95 simulated minutes. Initial telemetry is generated from the actual seeded simulator state.
+
+The raw score combines power (0.35), thermal behavior (0.25), pointing (0.20) and communications (0.20). Reported reward measures progress beyond the no-op world:
+
+```text
+reward = clamp((raw_score - initial_raw_score) / (1 - initial_raw_score), 0, 1)
 ```
 
----
+Logs include both raw components and normalized progress. Catastrophic hardware safety events remain latched and yield zero. Success targets and hardware facts are protected; increasing an agent deadband cannot relax scoring. Configuration validation runs even when orbital time has ended. Reference >= 0.95 and no-op <= 0.05 are checked automatically.
 
-## Scoring Model (Outcome-Based)
+The model is deliberately approximate: linear SoC/voltage, scalar attitude response, linearized heat loss and a baud-limited link-margin model. It does not claim three-axis rigid-body dynamics or flight certification.
 
+## Isolation and limits
+
+- Verifier and reward logic are in the harness container; no verifier code is copied into the sandbox.
+- Every tool/control endpoint requires the dynamically rotated harness token.
+- Agent code runs as UID 1001; evaluation scripts run as UID 1002. Identity lookup failures never fall back to root.
+- Worker processes, including detached descendants, are killed after every command and before reset.
+- The sandbox root filesystem is read-only. Workspace and temporary mounts have storage/inode bounds; workers have file, CPU, process, memory and output limits.
+- Protected file access rejects symlinks, hard links and special files. The sandbox network has no external route.
+- Execution ends at 40 model replies or 600 seconds, whichever comes first. Each reply allows 10 tools; each complete tool operation has a 60-second deadline. Final verification has a separate 120-second budget. Baselines share 120 seconds per task.
+- Provider calls run in a cancellable process without hidden SDK retries. Received malformed replies count once and get corrective feedback. Context trimming conservatively bounds request size while retaining valid tool/result groups.
+
+Docker and the host kernel remain part of the trust boundary. This is not a VM-level security guarantee. A failed task is an expected outcome when the verifier scores it honestly.
+
+## Validation
+
+With Python dependencies installed, run:
+
+```sh
+python tests/test_physics.py
+python -m unittest tests.test_adversarial tests.test_hardening tests.test_seeds_extended
 ```
-reward = power_balance (0.35)
-       + thermal_stability (0.25)
-       + adcs_precision (0.20)
-       + comms_closure (0.20)
-```
-- **Oracle Baseline**: Must score $\ge 0.95$ (achieves $1.00$).
-- **No-Op Baseline**: Must score $\le 0.05$ (achieves $0.00$).
-- If any catastrophic safety violation occurs (bus collapse below 3.10V, thermal runaway $>50^\circ\text{C}$, or unmitigated tumble), total reward is strictly zeroed.
 
----
+The seed suite checks actual reset hashes and both baselines across 100 task/seed combinations. For Linux UID/network/resource tests:
 
-## Directory Layout
+```sh
+docker compose up -d sandbox
+docker compose run --rm -v "${PWD}/tests:/app/tests:ro" -e FAIL_ON_UNAVAILABLE=1 harness python -m unittest tests.test_docker_security
+docker compose down
+```
 
+The runtime is pinned by image digest and Linux x86-64 wheel hashes in `requirements.lock`. To measure an uncached build without clearing other projects' caches:
+
+```sh
+python scripts/check_cold_build.py
 ```
-docker-compose.yml       harness (isolated+internet) + sandbox (isolated only)
-Dockerfile.sandbox       isolated workspace with hardened Python server
-Dockerfile.harness       verifier, limits, telemetry logger, baseline runner
-sandbox/server.py        authenticated tool server with token validation
-harness/verifier.py      orbital multi-physics simulation engine
-harness/tasks.py         5 flight tasks with symptom alerts & docs/flight_manual.md
-harness/env.py           reset / step / score with physics evaluation
-harness/runner.py        40-step limits, 600s time cap, 48K token context trimmer
-harness/agents.py        OpenAI-compatible client + mock/solver + mock/idle
-harness/run.py           entrypoint: oracle -> no-op -> model execution
-inputs/append.txt        default appended instructions file
-tests/test_physics.py    unit tests for orbital physics equations
-tests/test_adversarial.py unit tests for sandbox security, tokens & limits
+
+CI runs integration regressions, all-task gates, an offline solver run and live sandbox checks, and uploads sanitized logs. Offline solver results validate plumbing; they are not real-model capability evidence.
+
+## Logs and submission
+
+Each run writes `gate.json`, JSONL records, a unique run identifier and a source fingerprint manifest under `logs/`. Model runs also write a summary and episode termination, verifier reasons and diagnostics. Credentials are never part of the manifest.
+
+The registered team name is **Astro**. Generate the two-page design document, ten-slide deck and one archive with:
+
+```sh
+python scripts/build_submission_docs.py --team-name Astro
 ```
+
+Document generation requires `reportlab==4.4.9`. Use `--docs-only` to regenerate PDFs without an archive. Packaging requires current-code all-task gates, at least three genuine model runs, and success/failure trajectories. It validates episode records, matching source fingerprints, summaries and credential scans. It refuses to relabel historical logs or manufacture missing evidence. A failure sample may be an executed scripted adversarial regression, explicitly identified in failure-provenance.json; such a sample never counts as one of the three genuine model runs.
+
+The output is `Astro.zip`, containing `baseline-results/`, `test-run-logs/`, `sample-trajectories/`, `design-doc.pdf`, `deck.pdf` and a checksum manifest. Existing historical runs may be kept locally but do not certify changed code. Confirm the repository name, private visibility and organiser access against the submission instructions before uploading.

@@ -14,8 +14,8 @@ class ToolCall:
         """Return (args, error). `args` is a dict when the arguments are valid JSON."""
         try:
             args = json.loads(self.arguments) if self.arguments else {}
-        except json.JSONDecodeError as exc:
-            return None, f"arguments are not valid JSON ({exc.msg})"
+        except (json.JSONDecodeError, TypeError) as exc:
+            return None, f"arguments are not valid JSON ({exc})"
         if not isinstance(args, dict):
             return None, "arguments must be a JSON object"
         return args, None
@@ -33,6 +33,7 @@ class Reply:
     tool_calls: list = field(default_factory=list)
     raw: str = ""
     tokens: int = 0
+    error: str | None = None
 
 
 # ------------------------------------------------------------ real models
@@ -45,48 +46,48 @@ class OpenAIClient:
     """
 
     def __init__(self, model, api_key, base_url=None, max_tokens=None):
-        import openai
-        self.client = openai.OpenAI(api_key=api_key, base_url=base_url or None, max_retries=2)
-        self.model, self.max_tokens = model, max_tokens
+        self.model, self.api_key, self.base_url, self.max_tokens = model, api_key, base_url, max_tokens
 
     def start(self, task):
         pass
 
+    @staticmethod
+    def normalize(raw):
+        try:
+            data = json.loads(raw)
+            message = data["choices"][0]["message"]
+            text = message.get("content")
+            if text is not None and not isinstance(text, str):
+                raise ValueError("assistant content must be text")
+            calls, ids = [], set()
+            for index, call in enumerate(message.get("tool_calls") or []):
+                fn = call.get("function", {})
+                name = fn.get("name")
+                if not isinstance(name, str) or not name:
+                    raise ValueError("tool call missing function name")
+                call_id = call.get("id")
+                if not isinstance(call_id, str) or not call_id or call_id in ids:
+                    call_id = f"normalized_{index}"
+                ids.add(call_id)
+                calls.append(ToolCall(call_id, name, fn.get("arguments", ""), call.get("extra_content")))
+            return Reply(text, calls, raw, (data.get("usage") or {}).get("total_tokens", 0) or 0)
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
+            return Reply(None, raw=raw, error=f"Unreadable model reply: {exc}. Please call a supported tool.")
+
     def complete(self, messages, tools, timeout):
-        import time
-        t_start = time.monotonic()
-        kwargs = dict(model=self.model, messages=messages, tools=tools)
-        if self.max_tokens:
-            kwargs["max_tokens"] = self.max_tokens      # optional: set MAX_TOKENS to cap each reply
-        max_retries = 3
-        for attempt in range(max_retries):
-            elapsed = time.monotonic() - t_start
-            rem_timeout = timeout - elapsed
-            if rem_timeout <= 2.0:
-                raise TimeoutError("Episode deadline reached before completing request")
-            kwargs["timeout"] = min(rem_timeout, 45.0)
-            try:
-                response = self.client.chat.completions.create(**kwargs)
-                break
-            except Exception as exc:
-                err_str = str(exc)
-                time_left = timeout - (time.monotonic() - t_start)
-                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower()) and attempt < max_retries - 1 and time_left > 15.0:
-                    time.sleep(min(12.0, time_left - 3.0))
-                    continue
-                raise
-        message = response.choices[0].message
-        calls = []
-        for index, call in enumerate(message.tool_calls or []):
-            function = getattr(call, "function", None)
-            extra_content = getattr(call, "extra_content", None)
-            calls.append(ToolCall(id=call.id or f"call_{index}",
-                                  name=(function.name if function else "") or "",
-                                  arguments=(function.arguments if function else "") or "",
-                                  extra_content=extra_content))
-        usage = getattr(response, "usage", None)
-        return Reply(text=message.content, tool_calls=calls, raw=response.model_dump_json(),
-                     tokens=getattr(usage, "total_tokens", 0) or 0)
+        import subprocess, sys
+        request = dict(model=self.model, messages=messages, tools=tools, api_key=self.api_key,
+                       base_url=self.base_url, max_tokens=self.max_tokens, timeout=timeout)
+        # A separate process makes the complete API operation cancellable, including retries.
+        try:
+            result = subprocess.run([sys.executable, "-m", "harness.provider_worker"],
+                                    input=json.dumps(request), capture_output=True, text=True,
+                                    encoding="utf-8", timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError("model request exceeded its total deadline") from exc
+        if result.returncode:
+            raise RuntimeError("model provider request failed; check endpoint, model and credentials")
+        return self.normalize(result.stdout)
 
 
 # ------------------------------------------------------------ mock models

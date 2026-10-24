@@ -12,7 +12,8 @@ Key improvements:
   * medium : thermal_battery_preservation, rf_downlink_closure, safe_mode_cascade
 """
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import json
 from typing import Dict, List
 
 
@@ -29,6 +30,7 @@ class TaskInstance:
     initial_soc_pct: float = 75.0
     initial_temp_c: float = 14.0
     initial_pointing_error_deg: float = 35.0
+    mission: dict = field(default_factory=dict)
 
 
 # ---- 2. CubeSat Flight Manual (docs/flight_manual.md) ------------------
@@ -41,8 +43,8 @@ FLIGHT_MANUAL_MD = """\
 ---
 
 ## 1. Electrical Power Subsystem (EPS)
-- **Solar Array:** Triple-junction GaAs deployable panels (Total Area = 0.06 m², nominal cell efficiency = 28%).
-  - Maximum Power Point Tracking (MPPT) software calibration: `solar_efficiency = 0.72` (Nominal operational band: 0.70 – 0.75).
+- **Solar Array:** Triple-junction GaAs deployable panels (Total Area = 0.06 mÂ², nominal cell efficiency = 28%).
+  - Maximum Power Point Tracking (MPPT) software calibration: `solar_efficiency = 0.72` (Nominal operational band: 0.70 â€“ 0.75).
   - Software calibration below 0.50 causes acute solar power deficit, leading to battery brownout during eclipse.
   - Solar generation formula: `P_gen = solar_efficiency * 0.28 * 0.06 * 1361.0 * cos(theta_sun)` (Watts).
 - **Battery Pack:** 3S2P Li-ion (Nominal voltage 3.7V equivalent, 40.0 Wh capacity).
@@ -59,13 +61,13 @@ FLIGHT_MANUAL_MD = """\
 
 ## 3. Thermal Control Subsystem (TCS)
 - **Operational Temperature Limits:**
-  - Li-ion battery pack safe operating range: 0°C to +35°C.
-  - Critical thermal runaway threshold: > 50°C (irreversible cell venting/degradation).
-  - Freezing floor: < -15°C (electrolyte freezing).
+  - Li-ion battery pack safe operating range: 0Â°C to +35Â°C.
+  - Critical thermal runaway threshold: > 50Â°C (irreversible cell venting/degradation).
+  - Freezing floor: < -15Â°C (electrolyte freezing).
 - **Thermostat Parameters:**
-  - Nominal battery heater setpoint: `battery_heater_setpoint = 15.0` °C.
-  - Thermostat hysteresis: `heater_hysteresis_c = 2.0` °C (Turns ON at setpoint - hysteresis, OFF at setpoint).
-  - Thermal safety upper cutoff: `thermal_cutoff_temp = 45.0` °C (Emergency override to prevent runaway).
+  - Nominal battery heater setpoint: `battery_heater_setpoint = 15.0` Â°C.
+  - Thermostat hysteresis: `heater_hysteresis_c = 2.0` Â°C (Turns ON at setpoint - hysteresis, OFF at setpoint).
+  - Thermal safety upper cutoff: `thermal_cutoff_temp = 45.0` Â°C (Emergency override to prevent runaway).
 
 ## 4. Communications Subsystem (COMMS)
 - **Transceiver:** UHF direct-to-ground downlink at 437.5 MHz (500 km LEO orbit).
@@ -84,12 +86,12 @@ FLIGHT_MANUAL_MD = """\
 When diagnosing anomalies from `telemetry/live_telemetry.csv` and `telemetry/current_status.json`, cross-correlate telemetry columns before modifying configurations:
 
 1. **Low Bus Voltage / Rapid Eclipse Drain:**
-   - *Check ADCS first:* If `pointing_err_deg` > 20°, off-sun tumble is causing panel cosine illumination loss, starving generation. Neutralize reaction wheel momentum bias (`wheel_bias_rpm = 0`) and tighten deadband.
-   - *Check EPS MPPT:* If pointing is nominal (<= 5°) but `bus_v` steadily degrades during sunlight, MPPT `solar_efficiency` has drifted below nominal (0.70 - 0.75).
-   - *Check TCS Heater Load:* If `heater = ON` continuously even when core temp > 20°C, stuck heater consumes 2.5W baseline load, accelerating battery depletion.
+   - *Check ADCS first:* If `pointing_err_deg` > 20Â°, off-sun tumble is causing panel cosine illumination loss, starving generation. Neutralize reaction wheel momentum bias (`wheel_bias_rpm = 0`) and tighten deadband.
+   - *Check EPS MPPT:* If pointing is nominal (<= 5Â°) but `bus_v` steadily degrades during sunlight, MPPT `solar_efficiency` has drifted below nominal (0.70 - 0.75).
+   - *Check TCS Heater Load:* If `heater = ON` continuously even when core temp > 20Â°C, stuck heater consumes 2.5W baseline load, accelerating battery depletion.
 
 2. **Battery Temperature Elevation / Thermal Warning:**
-   - Inspect `battery_heater_setpoint` vs `live_telemetry.csv` temp trend. If setpoint exceeds 30°C, the thermostat will drive cells toward the 50°C catastrophic runaway limit. Reconfigure setpoint to 15.0°C and cutoff to 45.0°C.
+   - Inspect `battery_heater_setpoint` vs `live_telemetry.csv` temp trend. If setpoint exceeds 30Â°C, the thermostat will drive cells toward the 50Â°C catastrophic runaway limit. Reconfigure setpoint to 15.0Â°C and cutoff to 45.0Â°C.
 
 3. **Loss of Telemetry / Blackout During Pass:**
    - Verify link margin in `telemetry/current_status.json`. If negative or below 3.0 dB, check transceiver TX power (must be >= 28.0 dBm) and run `scripts/link_budget.py` to ensure it dynamically queries `path_loss_db` rather than using stale bench-test constants.
@@ -330,7 +332,7 @@ timestamp,zone,temp_c,heater_status,bus_current_a
 
     instructions = (
         "CRITICAL ALERT [TCS-THM-501]: Battery thermal zone reports rapid uncontrolled temperature rise "
-        "exceeding safe limits (approaching 50°C runaway threshold) due to an erroneous heater setpoint. "
+        "exceeding safe limits (approaching 50Â°C runaway threshold) due to an erroneous heater setpoint. "
         "Review `telemetry/thermal_log.csv` and `docs/flight_manual.md` for thermal constraints. "
         "Reconfigure `subsystems/thermal.cfg` with nominal setpoint and emergency cutoff temperatures "
         "to prevent catastrophic battery thermal failure."
@@ -382,7 +384,7 @@ baudrate_bps = 9600
         "COMMUNICATION FAILURE [COMMS-RF-404]: Ground station pass failed to achieve carrier lock; "
         "zero telemetry packets were downlinked. "
         "Two faults must be corrected: "
-        "(1) In `subsystems/comms.cfg`, transmitter power and antenna gain are set below required orbital link levels. "
+        "(1) In `subsystems/comms.cfg`, transmitter power is below required orbital link levels. "
         "(2) In `scripts/link_budget.py`, the path loss calculation is hardcoded to a legacy test constant instead "
         "of reading `path_loss_db` from `subsystems/comms.cfg`. "
         "Refer to `docs/flight_manual.md` for link margin specifications, repair both files, and confirm "
@@ -529,4 +531,25 @@ DEMO_TASK = "eps_eclipse_recovery"
 def build_task(task_id: str, seed: int) -> TaskInstance:
     if task_id not in TASKS:
         raise KeyError(f"unknown task '{task_id}'. Available: {', '.join(TASKS)}")
-    return TASKS[task_id](seed)
+    task = TASKS[task_id](seed)
+    rng = random.Random(seed ^ 0xA3E05)
+    task.mission = {
+        "path_loss_db": round(rng.uniform(140.0, 143.0), 2),
+        "antenna_gain_dbi": round(rng.uniform(7.0, 9.0), 2),
+        "battery_capacity_wh": 40.0,
+        "frequency_mhz": 437.5,
+        "min_final_soc_pct": round(rng.uniform(82.0, 86.0), 1) if task_id == "eps_eclipse_recovery" else 50.0,
+        "required_pointing_deg": 0.15,
+    }
+    # Gain and propagation loss are hardware facts, not flight-software repair knobs.
+    for mapping in (task.files, task.reference):
+        if "subsystems/comms.cfg" in mapping:
+            lines = mapping["subsystems/comms.cfg"].splitlines()
+            mapping["subsystems/comms.cfg"] = "\n".join(
+                f"{line.split('=')[0].strip()} = {task.mission[line.split('=')[0].strip()]}"
+                if '=' in line and line.split('=')[0].strip() in task.mission else line
+                for line in lines) + "\n"
+    task.files["docs/mission.json"] = json.dumps(task.mission, sort_keys=True, indent=2)
+    task.instructions += (" Mission requirements and fixed hardware properties are in docs/mission.json; "
+                          "do not modify hardware properties. Repair software controls to meet those requirements.")
+    return task

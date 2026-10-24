@@ -24,6 +24,7 @@ TOOLS = [
         "description": "Advance satellite orbital simulation by a given duration (1-30 minutes) to observe dynamic telemetry consequences of current subsystem configurations.",
         "parameters": {"type": "object", "properties": {
             "minutes": {"type": "integer",
+                        "minimum": 1, "maximum": 30,
                         "description": "Number of orbital minutes to advance (default 10, between 1 and 30)."}},
             "required": []}}},
     {"type": "function", "function": {
@@ -55,8 +56,10 @@ def check_args(name, args):
             return f"unexpected argument '{key}'"
         expected_type = spec["properties"][key].get("type", "string")
         if expected_type == "integer":
-            if not isinstance(value, int) and not (isinstance(value, str) and value.isdigit()):
+            if type(value) is not int:
                 return f"argument '{key}' must be an integer"
+            if not spec["properties"][key].get("minimum", value) <= value <= spec["properties"][key].get("maximum", value):
+                return f"argument '{key}' outside allowed range"
         elif not isinstance(value, str):
             return f"argument '{key}' must be a string"
     return None

@@ -17,7 +17,6 @@ SYSTEM_PROMPT = (
 )
 TRIMMED = "[older tool output removed to save context]"
 TRIMMED_ARGS = '{"note": "arguments removed to save context"}'
-VERIFY_RESERVE_S = 15.0  # Monotonic reserved time for verifier finalization
 
 
 @dataclass
@@ -31,7 +30,7 @@ class Limits:
 
 class JsonlLog:
     def __init__(self, path):
-        self.file = open(path, "a", buffering=1)
+        self.file = open(path, "a", buffering=1, encoding="utf-8")
 
     def write(self, record):
         self.file.write(json.dumps(record, default=str) + "\n")
@@ -55,168 +54,169 @@ def show(record):
 
 # --------------------------------------------------------- context trimming
 def estimate_tokens(messages):
-    return len(json.dumps(messages, default=str)) // 4
+    # UTF-8 byte count is deliberately conservative for byte-based tokenizers.
+    return len(json.dumps(messages, ensure_ascii=False, default=str).encode("utf-8"))
 
 
 def trim_history(messages, budget):
-    """Shrink old content until the conversation fits the token budget.
-
-    First old tool outputs are replaced by a short note, then the (possibly large)
-    arguments of old tool calls. The latest assistant turn and its results are
-    never touched, so the agent always sees what it just did.
-    """
     while estimate_tokens(messages) > budget:
-        last_assistant = max((i for i, m in enumerate(messages) if m["role"] == "assistant"), default=0)
-        victim = next((m for i, m in enumerate(messages)
-                       if m["role"] == "tool" and m["content"] != TRIMMED and i < last_assistant), None)
+        turns = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
+        if len(turns) > 1:
+            del messages[turns[0]:turns[1]]  # remove whole tool-call/result groups
+            continue
+        victim = next((m for m in messages[2:] if isinstance(m.get("content"), str)
+                       and len(m["content"]) > 128), None)
         if victim is not None:
             victim["content"] = TRIMMED
             continue
         shrunk = False
-        for m in messages[:last_assistant]:
-            for call in m.get("tool_calls", []):
+        for message in messages[2:]:
+            for call in message.get("tool_calls", []):
                 if call["function"]["arguments"] != TRIMMED_ARGS:
                     call["function"]["arguments"] = TRIMMED_ARGS
                     shrunk = True
-                    break
-            if shrunk:
-                break
         if not shrunk:
-            return          # nothing older left to shrink
+            raise ValueError("system/task instructions and tool schema exceed context budget")
 
 
 # ------------------------------------------------------------ baselines
-def run_scripted(env, task_id, seed, actions, agent, log):
-    """Run a scripted agent (oracle or no-op) through the same env code path as a model."""
-    env.reset(task_id, seed)
-    step, final = 0, None
-    for step, (name, args) in enumerate(actions, start=1):
-        text, is_error = env.step(name, args)
-        record = {"timestamp": now(), "agent": agent, "task": task_id, "step": step, "seed": seed,
-                  "model_input": None, "model_output_raw": None,
-                  "parsed_actions": [{"tool": name, "args": args}], "tool_result": [text],
-                  "errors": [{"kind": "tool_error", "detail": text}] if is_error else [],
-                  "state": {"hash": env.state_hash()}, "reward": env.score(), "tokens": 0, "latency_ms": 0}
-        log.write(record)
-        show(record)
-    final = env.score()
-    log.write({"timestamp": now(), "agent": agent, "task": task_id, "event": "episode_end",
-               "seed": seed, "steps": step, "reward": final})
-    return final
-
-
-# ---------------------------------------------------------- model episode
-def run_episode(env, task_id, seed, client, append_text, limits, log):
-    prompt = env.reset(task_id, seed)
-    client.start(env.task)
-    system = SYSTEM_PROMPT + (("\n\n" + append_text) if append_text else "")
-    messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
-    started, deadline, termination, finished, steps = None, None, None, False, 0
-
-    for step in range(1, limits.max_steps + 1):
-        if started is None:
-            started = time.monotonic()                      # clock starts at the first request
-            deadline = started + limits.max_seconds
-
-        time_left = (deadline - VERIFY_RESERVE_S) - time.monotonic()
-        if time_left <= 0:
-            termination = "time_cap"
-            break
-
-        trim_history(messages, limits.context_budget_tokens)
-        sent = copy.deepcopy(messages)
-        call_timeout = max(2.0, min(60.0, time_left))
-        call_start = time.monotonic()
-        steps = step
-        record = {"timestamp": now(), "agent": "model", "task": task_id, "step": step, "seed": seed,
-                  "model_input": sent, "model_output_raw": None, "parsed_actions": [], "tool_result": [],
-                  "errors": [], "state": {"hash": env.state_hash()}, "reward": None, "tokens": 0, "latency_ms": 0}
-
-        try:
-            reply = client.complete(sent, TOOLS, timeout=call_timeout)
-        except Exception as exc:    # includes provider errors and context-window overflow
-            record["errors"].append({"kind": "model_call_failed", "detail": f"{type(exc).__name__}: {exc}"})
-            log.write(record)
-            show(record)
-            termination = "crash"
-            break
-        record["latency_ms"] = int((time.monotonic() - call_start) * 1000)
-        record["model_output_raw"], record["tokens"] = reply.raw, reply.tokens
-
-        # keep every tool call in the history so each one gets a matching result
-        assistant = {"role": "assistant", "content": reply.text}
-        if reply.tool_calls:
-            calls_list = []
-            for c in reply.tool_calls:
-                c_dict = {"id": c.id, "type": "function",
-                          "function": {"name": c.name, "arguments": c.history_arguments()}}
-                if getattr(c, "extra_content", None):
-                    c_dict["extra_content"] = c.extra_content
-                calls_list.append(c_dict)
-            assistant["tool_calls"] = calls_list
-        messages.append(assistant)
-
-        if not reply.tool_calls:
-            record["errors"].append({"kind": "no_tool_call", "detail": "reply contained no tool call"})
-            messages.append({"role": "user", "content": "No tool call was received. Call one of the "
-                             "available tools, or call `finish` if you are done."})
-
-        for index, call in enumerate(reply.tool_calls):
-            # Check monotonic execution deadline before running tool
-            tool_time_left = (deadline - VERIFY_RESERVE_S) - time.monotonic()
-            if tool_time_left <= 0:
-                termination = "time_cap"
-                result = "not run: episode execution deadline exceeded"
-                record["errors"].append({"kind": "time_cap", "detail": "action exceeded remaining wall-clock budget"})
-                record["tool_result"].append(result)
-                messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-                finished = True
-                break
-
-            args, parse_error = call.parse()
-            record["parsed_actions"].append({"tool": call.name, "args": args, "parse_error": parse_error})
-            if finished:
-                result = "not run: the episode already finished"
-            elif index >= limits.max_tool_calls:
-                result = f"not run: at most {limits.max_tool_calls} tool calls are allowed per reply"
-                record["errors"].append({"kind": "too_many_tool_calls", "detail": call.name})
-            elif parse_error:
-                result = f"error: {parse_error}"
-                record["errors"].append({"kind": "unparsable_arguments", "detail": call.name})
-            elif call.name not in SPECS:
-                result = f"error: unknown tool '{call.name}'. Available tools: {', '.join(TOOL_NAMES)}"
-                record["errors"].append({"kind": "unknown_tool", "detail": call.name})
-            elif (problem := check_args(call.name, args)):
-                result = f"error: {problem}"
-                record["errors"].append({"kind": "invalid_arguments", "detail": f"{call.name}: {problem}"})
-            elif call.name == "finish":
-                finished, result = True, "Episode finished."
-            else:
-                result, is_error = env.step(call.name, args)
-                if is_error:
-                    record["errors"].append({"kind": "tool_error", "detail": result})
-            result = result[:limits.max_output_chars]
-            record["tool_result"].append(result)
-            messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-
+def diagnostics(env, record):
+    try:
         record["state"] = {"hash": env.state_hash()}
         record["reward"] = env.score()
-        log.write(record)
-        show(record)
-        if finished:
-            break
-    else:
-        termination = "step_cap"
-
-    try:
-        final = env.score()
+        record["verifier"] = dict(getattr(env, "last_verifier", {}))
     except Exception as exc:
-        final = {"total": None, "error": str(exc)}
-        termination = termination or "crash"
-    if termination is None:
-        termination = "success" if (final["total"] or 0) >= PASS_SCORE else "failure"
-    log.write({"timestamp": now(), "agent": "model", "task": task_id, "event": "episode_end", "seed": seed,
-               "steps": steps, "termination": termination, "reward": final,
-               "elapsed_s": round(time.monotonic() - started, 1) if started else 0})
-    return {"termination": termination, "steps": steps, "reward": final,
-            "elapsed_s": round(time.monotonic() - started, 1) if started else 0}
+        record["errors"].append({"kind": "diagnostics_failed", "detail": f"{type(exc).__name__}: {exc}"})
+        return False
+    return True
+
+
+def run_scripted(env, task_id, seed, actions, agent, log):
+    step, final, termination = 0, {"total": 0.0}, "crash"
+    try:
+        env.reset(task_id, seed)
+        for step, (name, args) in enumerate(actions, start=1):
+            text, is_error = env.step(name, args)
+            record = {"timestamp": now(), "agent": agent, "task": task_id, "step": step, "seed": seed,
+                      "model_input": None, "model_output_raw": None,
+                      "parsed_actions": [{"tool": name, "args": args}], "tool_result": [text],
+                      "errors": [{"kind": "tool_error", "detail": text}] if is_error else [],
+                      "state": {"hash": None}, "reward": None, "tokens": 0, "latency_ms": 0}
+            ok = diagnostics(env, record)
+            log.write(record)
+            show(record)
+            if not ok or is_error:
+                raise RuntimeError(text if is_error else "baseline diagnostics failed")
+        final = env.score()
+        termination = "success" if final["total"] >= PASS_SCORE else "failure"
+        return final
+    finally:
+        log.write({"timestamp": now(), "agent": agent, "task": task_id, "event": "episode_end",
+                   "seed": seed, "steps": step, "termination": termination, "reward": final,
+                   "verifier": dict(getattr(env, "last_verifier", {}))})
+
+
+def run_episode(env, task_id, seed, client, append_text, limits, log):
+    started, deadline, termination, steps = None, None, None, 0
+    final, fatal = {"total": None}, None
+    messages = []
+    try:
+        prompt = env.reset(task_id, seed)
+        client.start(env.task)
+        system = SYSTEM_PROMPT + (("\n\n" + append_text) if append_text else "")
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+        finished = False
+        while steps < limits.max_steps and not finished:
+            trim_history(messages, limits.context_budget_tokens - estimate_tokens(TOOLS) - 4096)
+            if started is None:
+                started = time.monotonic()
+                deadline = started + limits.max_seconds
+            if time.monotonic() >= deadline:
+                termination = "time_cap"
+                break
+            sent = copy.deepcopy(messages)
+            call_start = time.monotonic()
+            env.deadline = deadline
+            try:
+                reply = client.complete(sent, TOOLS, timeout=min(60.0, deadline - call_start))
+            except Exception as exc:
+                log.write({"timestamp": now(), "agent": "model", "task": task_id,
+                           "event": "model_call_failed", "seed": seed, "steps": steps,
+                           "error": f"{type(exc).__name__}: {exc}"})
+                termination = "time_cap" if time.monotonic() >= deadline else "crash"
+                break
+            steps += 1  # exactly one step per received reply, including malformed replies
+            record = {"timestamp": now(), "agent": "model", "task": task_id, "step": steps, "seed": seed,
+                      "model_input": sent, "model_output_raw": reply.raw,
+                      "parsed_actions": [], "tool_result": [], "errors": [],
+                      "state": {"hash": None}, "reward": None, "tokens": reply.tokens,
+                      "latency_ms": int((time.monotonic() - call_start) * 1000)}
+            assistant = {"role": "assistant", "content": reply.text}
+            if reply.tool_calls:
+                assistant["tool_calls"] = []
+                for call in reply.tool_calls:
+                    item = {"id": call.id, "type": "function",
+                            "function": {"name": call.name, "arguments": call.history_arguments()}}
+                    if call.extra_content:
+                        item["extra_content"] = call.extra_content
+                    assistant["tool_calls"].append(item)
+            messages.append(assistant)
+            if not reply.tool_calls:
+                detail = getattr(reply, "error", None) or "No tool call received; call a tool or finish."
+                record["errors"].append({"kind": "unreadable_reply" if getattr(reply, "error", None) else "no_tool_call", "detail": detail})
+                messages.append({"role": "user", "content": detail})
+            for index, call in enumerate(reply.tool_calls):
+                args, parse_error = call.parse()
+                record["parsed_actions"].append({"tool": call.name, "args": args, "parse_error": parse_error})
+                error_kind = None
+                if time.monotonic() >= deadline:
+                    result, error_kind = "not run: episode deadline exceeded", "time_cap"
+                    termination, finished = "time_cap", True
+                elif finished:
+                    result = "not run: episode already finished"
+                elif index >= limits.max_tool_calls:
+                    result, error_kind = "not run: at most 10 tool calls allowed per reply", "too_many_tool_calls"
+                elif parse_error:
+                    result, error_kind = "error: " + parse_error, "unparsable_arguments"
+                elif call.name not in SPECS:
+                    result, error_kind = "error: unknown tool; available: " + ", ".join(TOOL_NAMES), "unknown_tool"
+                elif (problem := check_args(call.name, args)):
+                    result, error_kind = "error: " + problem, "invalid_arguments"
+                elif call.name == "finish":
+                    finished, result = True, "Episode finished."
+                else:
+                    try:
+                        result, is_error = env.step(call.name, args)
+                        if is_error:
+                            error_kind = "tool_error"
+                    except Exception as exc:
+                        result, error_kind = f"error: {type(exc).__name__}: {exc}", "tool_error"
+                result = str(result)[:limits.max_output_chars]
+                if error_kind:
+                    record["errors"].append({"kind": error_kind, "detail": result})
+                record["tool_result"].append(result)
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+            if time.monotonic() >= deadline:
+                termination, finished = "time_cap", True
+            else:
+                diagnostics(env, record)
+            log.write(record)
+            show(record)
+        if termination is None and not finished:
+            termination = "step_cap"
+    except Exception as exc:
+        termination, fatal = "crash", f"{type(exc).__name__}: {exc}"
+    finally:
+        # Final verification has its own 120-second budget after model execution.
+        env.deadline = None
+        try:
+            final = env.score()
+        except Exception as exc:
+            final, termination = {"total": None, "error": f"{type(exc).__name__}: {exc}"}, "crash"
+        termination = termination or ("success" if (final.get("total") or 0) >= PASS_SCORE else "failure")
+        elapsed = round(time.monotonic() - started, 3) if started else 0
+        ending = {"timestamp": now(), "agent": "model", "task": task_id, "event": "episode_end",
+                  "seed": seed, "steps": steps, "termination": termination, "reward": final,
+                  "elapsed_s": elapsed, "error": fatal, "verifier": dict(getattr(env, "last_verifier", {}))}
+        log.write(ending)
+    return {key: ending[key] for key in ("termination", "steps", "reward", "elapsed_s", "verifier")}

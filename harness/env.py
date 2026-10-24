@@ -9,6 +9,9 @@ import hashlib
 import json
 import os
 import random
+import time
+import copy
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Any
 
@@ -22,23 +25,6 @@ from .verifier import (
 )
 
 PASS_SCORE = 0.95   # physical orbit survival & mission completion threshold
-
-
-def _verify_link_budget_behaviour(files: Dict[str, str]) -> bool:
-    """Helper used for offline physics validation of reference and no-op configurations."""
-    content = files.get("scripts/link_budget.py", files.get("comms/link_budget.py", ""))
-    if not content:
-        return False
-    import ast
-    try:
-        tree = ast.parse(content)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and node.value == "path_loss_db":
-                return True
-        return False
-    except Exception:
-        return False
-
 
 
 class Env:
@@ -62,6 +48,9 @@ class Env:
         self.seed = 0
         self._eval_cache: Dict[str, bool] = {}
         self._eval_call_count: int = 0
+        self.deadline = None
+        self.baseline = None
+        self.last_verifier = {}
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -69,17 +58,39 @@ class Env:
             headers["X-Harness-Secret"] = self.secret
         return headers
 
-    def _post(self, path: str, payload: dict, timeout: int):
-        response = requests.post(
-            self.url + path,
-            json=payload,
-            headers=self._headers(),
-            timeout=timeout
-        )
-        if not response.ok:
-            print(f"DEBUG HTTP ERROR: POST {path} returned {response.status_code}: {response.text}", flush=True)
-        response.raise_for_status()
-        return response.json()
+    @contextmanager
+    def budget(self, seconds):
+        previous = self.deadline
+        self.deadline = min(previous or float("inf"), time.monotonic() + seconds)
+        try:
+            yield
+        finally:
+            self.deadline = previous
+
+    def _remaining(self):
+        remaining = (self.deadline or (time.monotonic() + 60)) - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("operation deadline exceeded")
+        return remaining
+
+    def _request(self, method, path, payload=None):
+        remaining = self._remaining()
+        with requests.request(method, self.url + path, json=payload, headers=self._headers(),
+                              stream=True, timeout=(min(5, remaining), min(5, remaining))) as response:
+            response.raise_for_status()
+            chunks, size = [], 0
+            for chunk in response.iter_content(8192):
+                self._remaining()
+                size += len(chunk)
+                if size > 2_000_000:
+                    raise ValueError("sandbox response exceeds size limit")
+                chunks.append(chunk)
+            self._remaining()
+            return json.loads(b"".join(chunks))
+
+    def _post(self, path, payload, timeout):
+        with self.budget(timeout):
+            return self._request("POST", path, payload)
 
     def _parse_subsystem_configs(self, files: Dict[str, str]) -> Dict[str, float]:
         """Extract all subsystem parameters with fallback defaults and graceful error recovery."""
@@ -117,6 +128,7 @@ class Env:
             "antenna_gain_dbi": safe_float(comms_cfg, "comms", "antenna_gain_dbi", 2.0),
             "path_loss_db": safe_float(comms_cfg, "comms", "path_loss_db", 141.5),
             "baudrate_bps": safe_float(comms_cfg, "comms", "baudrate_bps", 9600.0),
+            "frequency_mhz": safe_float(comms_cfg, "comms", "frequency_mhz", 437.5),
         }
 
     # ---------------------------------------------------------------- reset
@@ -126,7 +138,7 @@ class Env:
         self.seed = seed
         self._eval_cache.clear()
         self._eval_call_count = 0
-        self._post("/reset", {"files": self.task.files}, self.tool_timeout)
+        self.baseline = None
 
         # Initialize the single authoritative episode multi-physics simulator
         self.sim = AuthoritativeOrbitSimulator(
@@ -134,7 +146,12 @@ class Env:
             initial_temp_c=self.task.initial_temp_c,
             initial_pointing_error_deg=self.task.initial_pointing_error_deg,
             task_id=self.task.task_id,
+            mission=self.task.mission,
         )
+        configs = self._parse_subsystem_configs(self.task.files)
+        status = self._initial_status(configs)
+        self._post("/reset", {"files": self.task.files, "status": status}, self.tool_timeout)
+        self.baseline = self.score()["raw_components"]
 
         return (
             f"MISSION CONTROLLER ALERT: {self.task.instructions}\n\n"
@@ -143,6 +160,16 @@ class Env:
             "Use the provided tools to inspect telemetry, modify subsystem configurations, "
             "verify behavior with `step_orbit` or `run_python`, then call `finish` to initiate orbital validation."
         )
+
+    def _initial_status(self, configs):
+        error = self.sim.pointing_err_deg
+        return {"elapsed_minutes": 0.0, "orbit_phase": "SUNLIGHT",
+                "bus_voltage_v": round(3.0 + 1.2 * self.sim.soc_wh / BATTERY_CAPACITY_WH, 2),
+                "battery_soc_pct": round(self.sim.soc_wh / BATTERY_CAPACITY_WH * 100, 1),
+                "battery_temp_c": self.sim.temp_c, "pointing_error_deg": error,
+                "heater_active": False,
+                "link_margin_db": round(configs["tx_power_dbm"] + configs["antenna_gain_dbi"] + 16
+                    - configs["path_loss_db"] - 2.5 + 100 - min(20, (error / 10) ** 2), 1)}
 
     def _sync_sim_telemetry(self, frames: list):
         """Update current_status.json and live_telemetry.csv in sandbox after physics evolution."""
@@ -165,13 +192,14 @@ class Env:
             f"{f.pointing_error_deg},{f.link_margin_db},{'ON' if f.heater_active else 'OFF'}\n"
             for f in frames
         )
-        try:
-            self._post("/sync_telemetry", {"status": status_payload, "csv_append": csv_lines}, self.tool_timeout)
-        except Exception:
-            pass
+        self._post("/sync_telemetry", {"status": status_payload, "csv_append": csv_lines}, self.tool_timeout)
 
     # ----------------------------------------------------------------- step
     def step(self, name: str, args: dict):
+        with self.budget(self.tool_timeout):
+            return self._step(name, args)
+
+    def _step(self, name: str, args: dict):
         """Run one tool call. Returns (text, is_error).
         
         Interprets step_orbit on the authoritative simulator and advances virtual time
@@ -193,7 +221,9 @@ class Env:
                 minutes = int(args.get("minutes", 10))
             except (ValueError, TypeError):
                 minutes = 10
-            advance_s = min(max(1, minutes) * 60.0, time_left_s)
+            if not 1 <= minutes <= 30:
+                return "error: minutes must be between 1 and 30", True
+            advance_s = min(minutes * 60.0, time_left_s)
             actual_min = round(advance_s / 60.0, 1)
 
             frames = self.sim.advance(advance_s, configs, dt_s=60.0)
@@ -205,7 +235,7 @@ class Env:
                     f"Orbit advanced by {actual_min} min (MET: {round(self.sim.time_s/60.0, 1)} min, "
                     f"Phase: {'ECLIPSE' if last_frame.eclipse else 'SUNLIGHT'}).\n"
                     f"Status: Bus={last_frame.bus_voltage_v}V, Battery SoC={last_frame.battery_soc_pct}%, "
-                    f"Temp={last_frame.battery_temp_c}°C, Pointing Err={last_frame.pointing_error_deg}°, "
+                    f"Temp={last_frame.battery_temp_c}Â°C, Pointing Err={last_frame.pointing_error_deg}Â°, "
                     f"Link Margin={last_frame.link_margin_db} dB (Heater: {'ON' if last_frame.heater_active else 'OFF'}).\n"
                     f"Updated telemetry in telemetry/live_telemetry.csv and telemetry/current_status.json"
                 )
@@ -227,13 +257,10 @@ class Env:
         return result["output"], result["is_error"]
 
     def state_hash(self) -> str:
-        response = requests.get(
-            self.url + "/state",
-            headers=self._headers(),
-            timeout=self.tool_timeout
-        )
-        files = response.json().get("files", {})
-        state_payload = {"files": files}
+        with self.budget(self.tool_timeout):
+            response = self._request("GET", "/state")
+        files = response.get("files", {})
+        state_payload = {"files": files, "mission": self.task.mission if self.task else {}}
         if self.sim:
             state_payload["sim"] = {
                 "time_s": round(self.sim.time_s, 2),
@@ -250,10 +277,14 @@ class Env:
                 "max_pointing_err_deg": round(self.sim.max_pointing_err_deg, 3),
                 "min_link_margin_db": round(self.sim.min_link_margin_db, 3),
             }
-        return hashlib.sha256(json.dumps(state_payload, sort_keys=True).encode()).hexdigest()[:8]
+        return hashlib.sha256(json.dumps(state_payload, sort_keys=True).encode()).hexdigest()
 
     # ---------------------------------------------------------------- score
     def score(self) -> Dict[str, Any]:
+        with self.budget(self.verify_timeout):
+            return self._score()
+
+    def _score(self) -> Dict[str, Any]:
         """Programmatic verifier: scores the authoritative episode trajectory and completes the orbit.
         
         Evaluates behavioural execution via isolated worker inside sandbox (zero harness execution),
@@ -272,16 +303,13 @@ class Env:
 
                 if cache_key in self._eval_cache:
                     behavior_ok = self._eval_cache[cache_key]
-                elif self._eval_call_count >= 12:
-                    # Strict cumulative evaluation limit to protect 10-minute budget
-                    behavior_ok = False
                 else:
                     self._eval_call_count += 1
-                    # Generate 3 randomized dynamic test vectors
+                    # Generate five seeded behavioural fixtures.
                     rng = random.Random(self.seed ^ 0x5F3759DF)
                     test_cases = []
                     expected_margins = []
-                    for _ in range(3):
+                    for _ in range(5):
                         t_tx = round(rng.uniform(22.0, 32.0), 1)
                         t_gain = round(rng.uniform(5.0, 15.0), 1)
                         t_loss = round(rng.uniform(130.0, 150.0), 1)
@@ -297,18 +325,17 @@ class Env:
                     try:
                         eval_res = self._post("/eval_script", eval_payload, self.tool_timeout)
                         actual_results = eval_res.get("results", [])
-                        behavior_ok = (len(actual_results) == 3 and all(
+                        behavior_ok = (len(actual_results) == len(test_cases) and all(
                             r is not None and abs(r - exp) < 0.15
                             for r, exp in zip(actual_results, expected_margins)
                         ))
-                    except Exception:
-                        behavior_ok = False
+                    except (requests.RequestException, TimeoutError):
+                        raise
 
                     self._eval_cache[cache_key] = behavior_ok
 
                 configs["script_verified"] = behavior_ok
-                if not behavior_ok:
-                    configs["path_loss_db"] = 175.0  # unresolved calculation penalty
+
 
         # Finalize projected orbit simulation through the 95-minute period
         if not self.sim:
@@ -319,7 +346,18 @@ class Env:
                 task_id=self.task.task_id if self.task else "",
             )
 
-        import copy
         sim_eval = copy.deepcopy(self.sim)
         sim_result: SimulationResult = sim_eval.finalize_orbit(configs)
-        return sim_result.reward
+        raw = sim_result.reward
+        baseline_total = self.baseline["total"] if self.baseline else 0.0
+        progress = max(0.0, min(1.0, (raw["total"] - baseline_total) / max(0.0001, 1.0 - baseline_total)))
+        keys = ("power_balance", "thermal_stability", "adcs_precision", "comms_closure")
+        gains = {key: max(0.0, raw[key] - (self.baseline[key] if self.baseline else 0.0)) for key in keys}
+        gain_sum = sum(gains.values())
+        result = {key: round(progress * gains[key] / gain_sum, 6) if gain_sum else 0.0 for key in keys}
+        result.update(total=round(progress, 6), raw_components=raw, baseline_total=baseline_total)
+        self.last_verifier = {"passed": progress >= PASS_SCORE, "failure_reason": sim_result.failure_reason,
+                              "projected": True, "final_soc_pct": round(sim_eval.soc_wh / BATTERY_CAPACITY_WH * 100, 3),
+                              "final_pointing_deg": round(sim_eval.pointing_err_deg, 3),
+                              "downlinked_kb": round(sim_eval.total_downlinked_kb, 3)}
+        return result

@@ -7,3 +7,5 @@ logs/*/
 .workspace/
 bundle_staging/
 *.zip
+
+.workspace-*/
