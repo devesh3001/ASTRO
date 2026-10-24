@@ -1,5 +1,6 @@
 """Agents: the model client, two offline mock models, and the baselines."""
 import json
+import re
 from dataclasses import dataclass, field
 
 
@@ -14,7 +15,7 @@ class ToolCall:
         """Return (args, error). `args` is a dict when the arguments are valid JSON."""
         try:
             args = json.loads(self.arguments) if self.arguments else {}
-        except (json.JSONDecodeError, TypeError) as exc:
+        except (ValueError, TypeError, RecursionError) as exc:
             return None, f"arguments are not valid JSON ({exc})"
         if not isinstance(args, dict):
             return None, "arguments must be a JSON object"
@@ -24,7 +25,10 @@ class ToolCall:
         """Arguments as stored in the conversation. Invalid JSON is replaced with {} so
         the next request is still accepted by every provider."""
         args, error = self.parse()
-        return json.dumps(args) if error is None else "{}"
+        try:
+            return json.dumps(args) if error is None else "{}"
+        except (ValueError, TypeError, RecursionError):
+            return "{}"
 
 
 @dataclass
@@ -74,15 +78,21 @@ class OpenAIClient:
             for index, call in enumerate(message.get("tool_calls") or []):
                 fn = call.get("function", {})
                 name = fn.get("name")
-                if not isinstance(name, str) or not name:
-                    raise ValueError("tool call missing function name")
+                if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+                    raise ValueError("tool call function name must contain 1-64 letters, digits, underscores or hyphens")
                 call_id = call.get("id")
-                if not isinstance(call_id, str) or not call_id or call_id in ids:
+                if (not isinstance(call_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", call_id)
+                        or call_id in ids):
+                    # Generated IDs must not collide with IDs already supplied by the model.
+                    suffix = 0
                     call_id = f"normalized_{index}"
+                    while call_id in ids:
+                        suffix += 1
+                        call_id = f"normalized_{index}_{suffix}"
                 ids.add(call_id)
                 calls.append(ToolCall(call_id, name, fn.get("arguments", ""), call.get("extra_content")))
             return Reply(text, calls, raw, (data.get("usage") or {}).get("total_tokens", 0) or 0)
-        except (ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError, RecursionError) as exc:
             return Reply(None, raw=raw, error=f"Unreadable model reply: {exc}. Please call a supported tool.")
 
     def complete(self, messages, tools, timeout):
@@ -113,18 +123,20 @@ class MockClient:
         self.kind = kind
         self.turn = 0
         self.task = None
+        self.pending = []
 
     def start(self, task):
         self.task, self.turn = task, 0
+        self.pending = (oracle_actions(task) + [("run_python", {"code": "print('verified')"})]
+                        if self.kind == "solver" else [])
 
     def complete(self, messages, tools, timeout):
         self.turn += 1
-        calls = []
-        if self.kind == "solver" and self.turn == 1:
-            calls.extend(oracle_actions(self.task))
-            calls.append(("run_python", {"code": "print('verified')"}))
+        if self.pending:
+            # Long privileged plans obey the same per-reply limit as real models.
+            calls, self.pending = self.pending[:9], self.pending[9:]
         else:
-            calls.append(("finish", {}))
+            calls = [("finish", {})]
         tool_calls = [ToolCall(f"mock-{self.turn}-{i}", name, json.dumps(args))
                       for i, (name, args) in enumerate(calls)]
         return Reply(text=None, tool_calls=tool_calls, raw=json.dumps({"mock": self.kind, "turn": self.turn}))

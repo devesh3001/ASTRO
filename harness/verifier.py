@@ -148,6 +148,12 @@ class AuthoritativeOrbitSimulator:
         self.tx_energy_wh: float = 0.0
         self.payload_energy_wh: float = 0.0
         self.observation_s: float = 0.0
+        self.science_buffer_kb = 0.0
+        self.science_generated_kb = 0.0
+        self.science_downlinked_kb = 0.0
+        self.science_dropped_kb = 0.0
+        self.science_peak_buffer_kb = 0.0
+        self.science_window_exposure_s = [0.0 for _ in self.mission.get("science_windows", [])]
 
         # Trajectory extremes
         self.min_bus_v: float = 3.0 + 1.2 * (self.soc_wh / BATTERY_CAPACITY_WH)
@@ -162,6 +168,8 @@ class AuthoritativeOrbitSimulator:
         self.frames: List[TelemetryFrame] = []
 
     def _validate(self, configs):
+        if configs.get("_config_errors"):
+            return False, "; ".join(configs["_config_errors"][:6])
         valid, reason = validate_subsystem_configs(configs)
         for key in ("path_loss_db", "antenna_gain_dbi", "battery_capacity_wh", "frequency_mhz"):
             if key in self.mission and configs.get(key) != self.mission[key]:
@@ -174,7 +182,11 @@ class AuthoritativeOrbitSimulator:
         return valid, reason
 
     def advance(self, duration_s: float, configs: Dict[str, Any], dt_s: float = 60.0) -> List[TelemetryFrame]:
-        """Advance authoritative orbit simulation by duration_s using current configs."""
+        """Advance the state on a fixed 30-second grid plus event boundaries.
+
+        dt_s is retained for source compatibility; public action grouping cannot
+        select the numerical resolution or earn extra mission progress.
+        """
         if duration_s <= 0:
             return []
 
@@ -203,6 +215,9 @@ class AuthoritativeOrbitSimulator:
         pass_start = self.mission.get("ground_pass_start_s", GROUND_PASS_START_S)
         pass_end = pass_start + self.mission.get("ground_pass_duration_s", GROUND_PASS_DURATION_S)
         end_s = min(ORBIT_PERIOD_S, self.time_s + duration_s)
+        passes = self.mission.get("ground_passes") or [{"start_s":pass_start,"duration_s":pass_end-pass_start}]
+        science_windows = self.mission.get("science_windows", [])
+        mission_events = [b for w in passes+science_windows for b in (w["start_s"],w["start_s"]+w["duration_s"])]
         observation_start = self.mission.get("observation_start_s", 0)
         observation_end = observation_start + self.mission.get("observation_duration_s", 0)
         new_frames = []
@@ -210,17 +225,20 @@ class AuthoritativeOrbitSimulator:
         while self.time_s < end_s - 1e-9:
             t = self.time_s
             # Split at physical events, so partial tool steps cannot create extra contact time.
-            boundaries = [b for b in (SUNLIGHT_PERIOD_S, pass_start, pass_end, observation_start, observation_end, end_s) if b > t + 1e-9]
-            actual_dt = min(dt_s, min(boundaries) - t)
+            boundaries = [b for b in (SUNLIGHT_PERIOD_S, observation_start, observation_end, end_s, *mission_events) if b > t + 1e-9]
+            # All public tools advance multiples of 30 seconds. A fixed global
+            # tick makes the same control history independent of tool grouping.
+            next_tick = (math.floor((t + 1e-8) / 30.0) + 1) * 30.0
+            actual_dt = min(30.0, next_tick - t, min(boundaries) - t)
             in_eclipse = t >= SUNLIGHT_PERIOD_S
-            in_ground_pass = pass_start <= t < pass_end
+            in_ground_pass = any(w["start_s"] <= t < w["start_s"]+w["duration_s"] for w in passes)
 
             # --------------------------------------------------------- 1. ADCS
             if abs(wheel_bias) > 20.0:
                 self.pointing_err_deg = min(120.0, self.pointing_err_deg + abs(wheel_bias) * 0.04 * (actual_dt / 60.0))
             else:
-                damping = min(0.35, gain * 0.06) * (actual_dt / 60.0)
-                self.pointing_err_deg = max(deadband, self.pointing_err_deg * (1.0 - damping))
+                retention = (1.0 - min(0.35, gain * 0.06)) ** (actual_dt / 60.0)
+                self.pointing_err_deg = max(deadband, self.pointing_err_deg * retention)
 
             self.max_pointing_err_deg = max(self.max_pointing_err_deg, self.pointing_err_deg)
             cos_sun = max(0.0, math.cos(math.radians(min(88.0, self.pointing_err_deg))))
@@ -243,6 +261,17 @@ class AuthoritativeOrbitSimulator:
             self.payload_energy_wh += payload_load * actual_dt / 3600.0
             if observation_start <= t < observation_end:
                 self.observation_s += duty * actual_dt
+            for index, window in enumerate(science_windows):
+                if window["start_s"] <= t < window["start_s"]+window["duration_s"]:
+                    exposure = duty*actual_dt
+                    generated = exposure*self.mission["science_rate_kb_s"]
+                    self.observation_s += exposure
+                    self.science_window_exposure_s[index] += exposure
+                    self.science_generated_kb += generated
+                    dropped = max(0.0, self.science_buffer_kb+generated-self.mission["science_buffer_capacity_kb"])
+                    self.science_dropped_kb += dropped
+                    self.science_buffer_kb = min(self.mission["science_buffer_capacity_kb"],self.science_buffer_kb+generated)
+                    self.science_peak_buffer_kb = max(self.science_peak_buffer_kb,self.science_buffer_kb)
             p_load = BASE_LOAD_POWER_W + payload_load
             if self.heater_on:
                 p_load += HEATER_POWER_W
@@ -289,12 +318,16 @@ class AuthoritativeOrbitSimulator:
 
             if in_ground_pass:
                 self.min_link_margin_db = min(self.min_link_margin_db, link_margin)
-                if link_margin >= 3.0 and bus_v >= uv_thresh:
-                    # Full data throughput bounded by baud rate
-                    self.total_downlinked_kb += effective_kb_per_sec * actual_dt
-                elif link_margin >= 0.0 and bus_v >= uv_thresh:
-                    # Marginal link: 50% packet error drop
-                    self.total_downlinked_kb += (effective_kb_per_sec * 0.5) * actual_dt
+                capacity = effective_kb_per_sec*actual_dt*(1.0 if link_margin>=3 else .5 if link_margin>=0 else 0)
+                if bus_v < uv_thresh:
+                    capacity = 0.0
+                if science_windows:
+                    delivered = min(self.science_buffer_kb,capacity)
+                    self.science_buffer_kb -= delivered
+                    self.science_downlinked_kb += delivered
+                    self.total_downlinked_kb = self.science_downlinked_kb
+                else:
+                    self.total_downlinked_kb += capacity
 
             self.time_s += actual_dt
             frame = TelemetryFrame(
@@ -396,7 +429,20 @@ class AuthoritativeOrbitSimulator:
             power_score, thermal_score, adcs_score, comms_score = [s * .8 for s in (power_score, thermal_score, adcs_score, comms_score)]
             if checks["payload_energy_allocation"]:
                 observation_score = .2 * clamp(self.observation_s / self.mission["required_observation_s"])
-        total_reward = round(power_score + thermal_score + adcs_score + comms_score + observation_score, 4)
+        science_score = 0.0
+        science_windows = self.mission.get("science_windows", [])
+        if science_windows:
+            power_score, thermal_score, adcs_score, comms_score = [v*.6 for v in (power_score,thermal_score,adcs_score,comms_score)]
+            fractions = [clamp(e/w["required_exposure_s"]) for e,w in zip(self.science_window_exposure_s,science_windows)]
+            for index,(exposure,window) in enumerate(zip(self.science_window_exposure_s,science_windows)):
+                checks[f"science_window_{index+1}"] = exposure+1e-6>=window["required_exposure_s"]
+            checks["science_buffer_no_loss"] = self.science_dropped_kb<=self.mission.get("max_science_loss_kb",0)+1e-6
+            checks["science_payload_delivered"] = self.science_downlinked_kb+1e-6>=self.mission["required_science_downlink_kb"]
+            checks["science_data_conservation"] = abs(self.science_generated_kb-self.science_buffer_kb-self.science_downlinked_kb-self.science_dropped_kb)<=1e-5
+            checks["payload_energy_allocation"] = self.payload_energy_wh<=self.mission["max_payload_energy_wh"]+1e-9
+            observation_score = .2*sum(fractions)/len(fractions)
+            science_score = .2*clamp(self.science_downlinked_kb/self.mission["required_science_downlink_kb"])
+        total_reward = round(power_score + thermal_score + adcs_score + comms_score + observation_score + science_score, 4)
         passed = total_reward >= 0.95 and all(checks.values())
 
         return SimulationResult(
@@ -406,7 +452,8 @@ class AuthoritativeOrbitSimulator:
                 "thermal_stability": round(thermal_score, 4),
                 "adcs_precision": round(adcs_score, 4),
                 "comms_closure": round(comms_score, 4),
-                **({"observation_completion": round(observation_score, 4)} if "required_observation_s" in self.mission else {}),
+                **({"observation_completion": round(observation_score, 4)} if "required_observation_s" in self.mission or science_windows else {}),
+                **({"science_delivery":round(science_score,4)} if science_windows else {}),
                 "total": total_reward,
             },
             frames=self.frames,

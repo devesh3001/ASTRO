@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from harness.provenance import CONTRACT_VERSION, contract_fingerprint
 from harness.agents import oracle_actions
 from harness.tasks import TASKS, _EPS_CFG_NOMINAL, _ADCS_CFG_NOMINAL, _THERMAL_CFG_NOMINAL, _LINK_BUDGET_SCRIPT_FIXED
 from tests.support import environment
@@ -60,6 +61,7 @@ def main():
             print(task, {p: counts[f'{task}/{p}'] for p in policies}, flush=True)
     harness, sandbox = fingerprints()
     result = {'benchmark_type': 'scripted_policy_ablation', 'model_called': False,
+              'contract_version': CONTRACT_VERSION, 'runtime_contract_sha256':contract_fingerprint(),
               'harness_sha256': harness, 'sandbox_sha256': sandbox,
               'seeds': args.seeds, 'tasks': args.tasks, 'policies': policies,
               'reference_is_privileged': True, 'production_isolation_tested': False,

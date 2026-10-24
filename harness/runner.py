@@ -76,6 +76,18 @@ def trim_history(messages, budget):
                     call["function"]["arguments"] = TRIMMED_ARGS
                     shrunk = True
         if not shrunk:
+            # Opaque provider metadata (for example signed reasoning) must stay
+            # byte-exact. Drop its complete call/result group rather than alter
+            # the signature or let a single reply make every next call fail.
+            if turns:
+                start = turns[0]
+                results = [m.get("content", "")[:300] for m in messages[start:]
+                           if m.get("role") == "tool" and isinstance(m.get("content"), str)]
+                del messages[start:]
+                messages.append({"role": "user", "content":
+                    "Previous tool exchange omitted to fit context; actions already executed. "
+                    + "Recent results: " + " | ".join(results[:10])})
+                continue
             raise ValueError("system/task instructions and tool schema exceed context budget")
 
 
@@ -160,7 +172,7 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
                       "parsed_actions": [], "tool_result": [], "errors": [],
                       "state": {"hash": None}, "reward": None, "tokens": reply.tokens,
                       "latency_ms": int((time.monotonic() - call_start) * 1000)}
-            assistant = {"role": "assistant", "content": reply.text}
+            assistant = {"role": "assistant", "content": reply.text if reply.text is not None else (None if reply.tool_calls else "[Unreadable or empty model reply]")}
             if reply.tool_calls:
                 assistant["tool_calls"] = []
                 for call in reply.tool_calls:
@@ -169,6 +181,7 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
                     if call.extra_content:
                         item["extra_content"] = call.extra_content
                     assistant["tool_calls"].append(item)
+            history_start = len(messages)
             messages.append(assistant)
             if not reply.tool_calls:
                 detail = getattr(reply, "error", None) or "No tool call received; call a tool or finish."
@@ -205,6 +218,18 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
                     record["errors"].append({"kind": error_kind, "detail": result})
                 record["tool_result"].append(result)
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+            if len(reply.tool_calls)>128:
+                # Preserve every raw call/result in the log, but do not let a
+                # huge rejected batch exhaust the next provider's context.
+                kept = assistant["tool_calls"][:limits.max_tool_calls]
+                ids = {call["id"] for call in kept}
+                results = [m for m in messages[history_start+1:] if m.get("tool_call_id") in ids]
+                assistant["tool_calls"] = kept
+                del messages[history_start+1:]
+                messages.extend(results)
+                detail = f"Error: {len(reply.tool_calls)-limits.max_tool_calls} extra tool calls were rejected; at most {limits.max_tool_calls} may execute per reply. Full rejected results are recorded in the episode log."
+                messages.append({"role":"user","content":detail})
+                record["errors"].append({"kind":"excess_history_compacted","detail":detail})
             if time.monotonic() >= deadline:
                 termination, finished = "time_cap", True
             else:

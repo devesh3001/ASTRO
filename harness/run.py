@@ -23,6 +23,7 @@ import requests
 
 from .agents import make_client, noop_actions, oracle_actions
 from .env import Env, PASS_SCORE
+from .provenance import CONTRACT_VERSION, contract_fingerprint, harness_fingerprint
 from .runner import JsonlLog, Limits, now, run_episode, run_scripted
 from .tasks import DEMO_TASK, TASKS, build_task
 
@@ -143,11 +144,11 @@ def main():
     except RuntimeError as exc:
         print(f"error: {exc}", flush=True)
         return 1
-    source_files = sorted(Path(__file__).parent.glob("*.py"))
-    source_hash = hashlib.sha256(b"".join(p.name.encode() + p.read_bytes().replace(b"\r\n", b"\n") for p in source_files)).hexdigest()
+    source_hash = harness_fingerprint()
     sandbox_build = requests.get(url + "/health", timeout=5).json().get("build_sha256")
-    manifest = {"contract_version": 2, "harness_sha256": source_hash,
-                "sandbox_sha256": sandbox_build, "model": model, "seed": seed, "mode": mode}
+    manifest = {"contract_version": CONTRACT_VERSION, "harness_sha256": source_hash,
+                "sandbox_sha256": sandbox_build, "runtime_contract_sha256": contract_fingerprint(),
+                "model": model, "seed": seed, "mode": mode}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     env = Env(url)
     task_ids = [task_id] if mode == "full" else list(TASKS)

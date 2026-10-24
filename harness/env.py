@@ -23,6 +23,7 @@ from .verifier import (
     BATTERY_CAPACITY_WH,
     SimulationResult,
     link_margin_db,
+    validate_subsystem_configs,
 )
 
 PASS_SCORE = 0.95   # physical orbit survival & mission completion threshold
@@ -94,14 +95,15 @@ class Env:
             return self._request("POST", path, payload)
 
     def _parse_subsystem_configs(self, files: Dict[str, str]) -> Dict[str, float]:
-        """Extract all subsystem parameters with fallback defaults and graceful error recovery."""
+        """Parse declared controls; mandatory malformed values cannot silently become nominal."""
+        config_errors = []
         def safe_read(raw: str) -> configparser.ConfigParser:
             parser = configparser.ConfigParser()
             if raw and raw.strip():
                 try:
                     parser.read_string(raw)
                 except (configparser.Error, UnicodeDecodeError, ValueError):
-                    pass
+                    config_errors.append("Malformed subsystem configuration")
             return parser
 
         eps_cfg = safe_read(files.get("subsystems/eps.cfg", files.get("eps.cfg", "")))
@@ -113,9 +115,11 @@ class Env:
             try:
                 return float(parser[section][key])
             except Exception:
+                if key not in ("payload_duty_cycle", "baudrate_bps") or parser.has_option(section,key):
+                    config_errors.append(f"Missing or non-numeric {section}.{key}")
                 return default
 
-        return {
+        parsed = {
             "solar_efficiency": safe_float(eps_cfg, "power", "solar_efficiency", 0.40),
             "payload_duty_cycle": safe_float(eps_cfg, "power", "payload_duty_cycle", 0.0),
             "undervoltage_threshold": safe_float(eps_cfg, "power", "undervoltage_threshold", 2.80),
@@ -132,6 +136,8 @@ class Env:
             "baudrate_bps": safe_float(comms_cfg, "comms", "baudrate_bps", 9600.0),
             "frequency_mhz": safe_float(comms_cfg, "comms", "frequency_mhz", 437.5),
         }
+        parsed["_config_errors"] = config_errors
+        return parsed
 
     # ---------------------------------------------------------------- reset
     def reset(self, task_id: str, seed: int) -> str:
@@ -163,6 +169,15 @@ class Env:
             "verify behavior with `step_orbit` or `run_python`, then call `finish` to initiate orbital validation."
         )
 
+    def _science_status(self, sim=None):
+        sim = sim or self.sim
+        return {"science_buffer_kb":round(sim.science_buffer_kb,6),
+                "science_generated_kb":round(sim.science_generated_kb,6),
+                "science_downlinked_kb":round(sim.science_downlinked_kb,6),
+                "science_dropped_kb":round(sim.science_dropped_kb,6),
+                "science_peak_buffer_kb":round(sim.science_peak_buffer_kb,6),
+                "science_window_exposure_s":[round(v,6) for v in sim.science_window_exposure_s]}
+
     def _initial_status(self, configs):
         error = self.sim.pointing_err_deg
         return {"elapsed_minutes": 0.0, "orbit_phase": "SUNLIGHT",
@@ -172,7 +187,7 @@ class Env:
                 "heater_active": False,
                 "pass_active": False, "data_downlinked_kb": 0.0, "tx_energy_wh": 0.0,
                 "observation_s": 0.0, "payload_energy_wh": 0.0,
-                "link_margin_db": round(link_margin_db(configs, error), 1)}
+                "link_margin_db": round(link_margin_db(configs, error), 1), **self._science_status()}
 
 
     def _sync_sim_telemetry(self, frames: list):
@@ -194,6 +209,7 @@ class Env:
             "tx_energy_wh": round(self.sim.tx_energy_wh, 5),
             "observation_s": round(self.sim.observation_s, 3),
             "payload_energy_wh": round(self.sim.payload_energy_wh, 5),
+            **self._science_status(),
         }
         csv_lines = "".join(
             f"{round(f.time_s/60.0, 1)},{'ECLIPSE' if f.eclipse else 'SUNLIGHT'},"
@@ -273,6 +289,7 @@ class Env:
         state_payload = {"files": files, "mission": self.task.mission if self.task else {}}
         if self.sim:
             state_payload["sim"] = {
+                **self._science_status(),
                 "time_s": round(self.sim.time_s, 2),
                 "soc_wh": round(self.sim.soc_wh, 4),
                 "temp_c": round(self.sim.temp_c, 3),
@@ -308,30 +325,46 @@ class Env:
         configs = self._parse_subsystem_configs(files)
 
         # Dynamic behavioural verification of link budget script on unprivileged sandbox worker
-        if self.task and "scripts/link_budget.py" in self.task.files:
+        if (self.task and "scripts/link_budget.py" in self.task.files
+                and not configs.get("_config_errors") and validate_subsystem_configs(configs)[0]):
             if "scripts/link_budget.py" in self.task.files or "scripts/link_budget.py" in files:
                 script_content = files.get("scripts/link_budget.py", "")
                 script_hash = hashlib.sha256(script_content.encode("utf-8")).hexdigest()
-                cache_key = f"{script_hash}:{self.seed}"
+                cache_key = f"{script_hash}:{hashlib.sha256(files.get('subsystems/comms.cfg', '').encode()).hexdigest()}:{self.seed}"
 
                 if cache_key in self._eval_cache:
                     behavior_ok = self._eval_cache[cache_key]
                 else:
                     self._eval_call_count += 1
-                    # Generate five seeded behavioural fixtures.
+                    # Test the exact live configuration plus seven full-schema
+                    # variants. Optional hardware fields must not identify a fixture.
                     rng = random.Random(self.seed ^ 0x5F3759DF)
-                    test_cases = []
-                    expected_margins = []
-                    for _ in range(5):
-                        t_tx = round(rng.uniform(22.0, 32.0), 1)
-                        t_gain = round(rng.uniform(5.0, 15.0), 1)
-                        t_loss = round(rng.uniform(130.0, 150.0), 1)
-                        t_rate = rng.choice([4800, 9600, 19200, 38400])
-                        cfg_str = f"[comms]\ntx_power_dbm = {t_tx}\nantenna_gain_dbi = {t_gain}\npath_loss_db = {t_loss}\nbaudrate_bps = {t_rate}\n"
-                        test_cases.append({"subsystems/comms.cfg": cfg_str})
-                        exp_m = round(link_margin_db({"tx_power_dbm": t_tx, "antenna_gain_dbi": t_gain,
-                                                            "path_loss_db": t_loss, "baudrate_bps": t_rate}), 2)
-                        expected_margins.append(exp_m)
+                    actual_cfg = files.get("subsystems/comms.cfg", "")
+                    test_cases = [{"subsystems/comms.cfg": actual_cfg}]
+                    expected_margins = [round(link_margin_db(configs), 2)]
+                    for index in range(7):
+                        parser = configparser.ConfigParser(interpolation=None)
+                        try:
+                            parser.read_string(actual_cfg)
+                        except configparser.Error:
+                            parser = configparser.ConfigParser(interpolation=None)
+                        if not parser.has_section("comms"):
+                            parser.add_section("comms")
+                        values = {"tx_power_dbm": round(rng.uniform(22, 32), 1),
+                                  "antenna_gain_dbi": round(rng.uniform(5, 15), 1),
+                                  "path_loss_db": round(rng.uniform(130, 150), 1),
+                                  "baudrate_bps": rng.choice([4800, 9600, 19200, 38400])}
+                        for key, value in values.items():
+                            parser.set("comms", key, str(value))
+                        # Exercise the documented absent-baud default as well.
+                        if index == 6:
+                            parser.remove_option("comms", "baudrate_bps")
+                            values["baudrate_bps"] = 9600
+                        import io
+                        text = io.StringIO()
+                        parser.write(text)
+                        test_cases.append({"subsystems/comms.cfg": text.getvalue()})
+                        expected_margins.append(round(link_margin_db(values), 2))
 
                     eval_payload = {
                         "script_relpath": "scripts/link_budget.py",
@@ -375,6 +408,7 @@ class Env:
         result.update(total=round(progress, 6), raw_components=raw, baseline_total=baseline_total)
         self.last_verifier = {"passed": sim_result.passed and progress >= PASS_SCORE, "failure_reason": sim_result.failure_reason,
                               "checks": sim_result.checks,
+                              **self._science_status(sim_eval),
                               "tx_energy_wh": round(sim_eval.tx_energy_wh, 5),
                               "observation_s": round(sim_eval.observation_s, 3),
                               "payload_energy_wh": round(sim_eval.payload_energy_wh, 5),

@@ -11,5 +11,7 @@ COPY requirements.txt requirements.lock ./
 # The cache mount keeps downloaded wheels between rebuilds without putting them in the image.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --require-hashes -r requirements.lock && pip check
+# Non-secret build inputs are retained for evidence provenance across host and image.
+COPY Dockerfile.harness Dockerfile.sandbox docker-compose.yml .dockerignore requirements.txt requirements.lock ./build-contract/
 COPY harness ./harness
 CMD ["python", "-m", "harness.run"]

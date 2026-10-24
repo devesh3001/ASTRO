@@ -10,11 +10,16 @@ def main():
                            max_retries=0)
     if not request.get("max_tokens"):
         request.pop("max_tokens", None)
-    response = client.chat.completions.with_raw_response.create(**request)
-    raw = response.text
-    if len(raw.encode("utf-8")) > 1_000_000:
-        raise ValueError("provider response exceeds output limit")
-    sys.stdout.write(raw)
+    # Stream the HTTP body into a bounded buffer, while requesting a normal
+    # non-streaming model reply. Never buffer an unlimited provider body first.
+    with client.chat.completions.with_streaming_response.create(**request) as response:
+        chunks, size = [], 0
+        for chunk in response.iter_bytes(chunk_size=8192):
+            size += len(chunk)
+            if size > 1_000_000:
+                raise ValueError("provider response exceeds output limit")
+            chunks.append(chunk)
+        sys.stdout.write(b"".join(chunks).decode("utf-8"))
 
 
 if __name__ == "__main__":

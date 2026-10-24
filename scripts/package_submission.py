@@ -11,14 +11,25 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from harness.tasks import TASKS
+from harness.provenance import CONTRACT_VERSION, contract_fingerprint as _contract_fingerprint, fingerprints as _fingerprints
 
 
 def fingerprints():
-    harness = hashlib.sha256(b"".join(p.name.encode() + p.read_bytes().replace(b"\r\n", b"\n")
-                                   for p in sorted((ROOT / "harness").glob("*.py")))).hexdigest()
-    sandbox = hashlib.sha256(b"".join((ROOT / "sandbox" / name).read_bytes() for name in
-                                   ("server.py", "runtime.py")).replace(b"\r\n", b"\n")).hexdigest()
-    return harness, sandbox
+    return _fingerprints(ROOT)
+
+
+def contract_fingerprint():
+    return _contract_fingerprint(ROOT)
+
+
+def provenance_matches(record, source=None, contract=None):
+    """All current evidence must name the source and expected build contract."""
+    harness, sandbox = fingerprints() if source is None else source
+    contract = contract_fingerprint() if contract is None else contract
+    return (isinstance(record, dict) and record.get("contract_version") == CONTRACT_VERSION
+            and record.get("harness_sha256") == harness
+            and record.get("sandbox_sha256") == sandbox
+            and record.get("runtime_contract_sha256") == contract)
 
 
 def json_file(path):
@@ -26,15 +37,14 @@ def json_file(path):
 
 
 def collect_evidence(logs):
-    harness, sandbox = fingerprints()
+    source, contract = fingerprints(), contract_fingerprint()
     gates, runs, successes, failures = [], [], [], []
     for directory in sorted(logs.iterdir() if logs.is_dir() else [], reverse=True):
         if not directory.is_dir():
             continue
         try:
             manifest = json_file(directory / "manifest.json")
-            if (manifest.get("contract_version") != 2 or manifest.get("harness_sha256") != harness
-                    or manifest.get("sandbox_sha256") != sandbox):
+            if not provenance_matches(manifest, source, contract):
                 continue
             gate_path = directory / "gate.json"
             gate = json_file(gate_path)
@@ -118,7 +128,7 @@ def assemble(team, logs, output):
         try:
             manifest = json_file(directory / "manifest.json")
             summary = json_file(directory / "summary.json")
-            if (manifest.get("harness_sha256"), manifest.get("sandbox_sha256")) != fingerprints():
+            if not provenance_matches(manifest):
                 continue
             if not (summary.get("model_called") and not str(summary.get("model", "mock/")).startswith("mock/")
                     and summary.get("termination") == "crash" and summary.get("steps") == 0):
@@ -135,13 +145,15 @@ def assemble(team, logs, output):
     reviewed_evidence = ROOT / "submission_bundle/validation-evidence.json"
     if reviewed_evidence.is_file():
         record = json_file(reviewed_evidence)
-        if (record.get("harness_sha256"), record.get("sandbox_sha256")) != fingerprints():
+        if not provenance_matches(record):
             raise ValueError("Reviewed evidence summary belongs to older runtime source")
         include(reviewed_evidence, "baseline-results/validation-evidence.json")
         for probe in record.get("defense_probes", {}).get("results", []):
             directory = logs / probe["run_id"]
             if directory.parent != logs or not directory.is_dir():
                 raise ValueError("Missing executed defense-probe evidence")
+            if not provenance_matches(json_file(directory / "manifest.json")):
+                raise ValueError("Executed defense-probe evidence belongs to an older runtime contract")
             for name in ("manifest.json", "episode.jsonl", "summary.json"):
                 include(directory/name, f"sample-trajectories/defense-probes/{directory.name}/"+name)
     include(success, "sample-trajectories/success.jsonl")
@@ -162,8 +174,10 @@ def assemble(team, logs, output):
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, data in sorted(selected.items()):
             archive.writestr(name, data)
-        archive.writestr("evidence-manifest.json", json.dumps({"team": team, "harness_sha256": fingerprints()[0],
-                          "sandbox_sha256": fingerprints()[1], "qualifying_model_run_ids": [p.name for p in runs],
+        archive.writestr("evidence-manifest.json", json.dumps({"team": team, "contract_version": CONTRACT_VERSION,
+                          "harness_sha256": fingerprints()[0], "sandbox_sha256": fingerprints()[1],
+                          "runtime_contract_sha256": contract_fingerprint(),
+                          "qualifying_model_run_ids": [p.name for p in runs],
                           "diagnostic_provider_attempt_ids": diagnostic_attempts, "files": {n: hashlib.sha256(d).hexdigest() for n, d in selected.items()}}, indent=2))
     print(f"Validated archive: {output}")
 

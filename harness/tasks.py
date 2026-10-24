@@ -7,10 +7,10 @@ Key improvements:
   bounds, equations, and diagnostic guidelines.
 - Dynamic seed variety: Seeds alter orbital initial conditions, telemetry noise,
   and fault profiles while maintaining guaranteed solvability for reference solutions.
-- Eight tasks across three difficulty levels:
+- Nine tasks across three difficulty levels:
   * easy   : eps_eclipse_recovery, adcs_detumble_pointing
   * medium : thermal_battery_preservation, rf_downlink_closure, safe_mode_cascade
-  * hard   : rf_energy_tradeoff, early_pass_recovery, observation_window_scheduling
+  * hard   : rf_energy_tradeoff, early_pass_recovery, observation_window_scheduling, science_store_forward
 """
 import random
 import math
@@ -40,7 +40,7 @@ class TaskInstance:
 
 FLIGHT_MANUAL_MD = """\
 # AEROSENTINEL-3U CUBESAT FLIGHT SOFTWARE MANUAL
-**Document Ref:** AS3U-FSW-OPS-v4.0
+**Document Ref:** AS3U-FSW-OPS-v5.0
 **Orbit Specification:** 500 km Circular LEO, Period = 95 min (60 min sun, 35 min eclipse). Contact timing is mission-specific.
 
 ---
@@ -59,7 +59,7 @@ FLIGHT_MANUAL_MD = """\
 - **Actuators:** 3-axis reaction wheel assembly + magnetic torquers.
   - Nominal steady-state wheel bias: `wheel_bias_rpm = 0` (Residual momentum bias causes continuous attitude precession).
   - Fine pointing deadband: `pointing_deadband_deg = 0.05` degrees.
-  - Control loop proportional gain: `control_gain = 2.0` (Gains below 1.0 result in underdamped sluggish pointing).
+  - Control loop proportional gain: `control_gain = 2.0` (Gains below 1.0 produce slower scalar pointing recovery).
   - The simulator tracks one scalar pointing error. Final pointing must meet `required_pointing_deg` in `docs/mission.json` (normally 0.15 degrees).
 
 ## 3. Thermal Control Subsystem (TCS)
@@ -97,7 +97,13 @@ On an observation mission, `payload_duty_cycle` in `subsystems/eps.cfg` is a sof
 
 Meet `required_observation_s` while keeping total payload energy below `max_payload_energy_wh`. Enable near the observation start and disable after the exposure, using `step_orbit` to schedule changes. Leaving it off misses the objective; leaving it on wastes energy. Mission time never rewinds. Every ordinary tool call advances 30 simulated seconds; `step_orbit` advances its requested 1-30 minutes.
 
+On science store-and-forward missions, `science_windows` and `ground_passes` are protected lists of disjoint windows. Useful exposure generates `science_rate_kb_s * duty * seconds` kB into finite storage. Overflow permanently drops data. A contact delivers at most the data already in the buffer, bounded by the radio channel rate and margin. Every science window has an exposure quota, both energy allocations apply, and no science loss is allowed. Telemetry must conserve: generated = buffered + delivered + dropped. The first contact is needed to clear space for the second acquisition.
+
+The simulator uses a fixed global 30-second integration grid, split exactly at protected event boundaries, independent of how tool calls group elapsed time. Scalar pointing uses exponential retention calibrated to the declared one-minute damping, so extra reads cannot change the numerical convergence rate.
+
 This is an evaluation model: scalar pointing, linear voltage, linear heat loss and averaged payload duty. The actuator torque/frequency and thermal polling fields are descriptive only. The model does not simulate a charger current regulator, rigid-body dynamics, orbital propagation or a radiation model.
+
+Historical incident CSV files provide background fault signatures. Current state comes from telemetry/current_status.json and telemetry/live_telemetry.csv, which the harness generates from the actual seeded simulator. Historical incident rows are not a replay of this episode.
 
 ## 6. Multi-Subsystem Telemetry Diagnostics & Fault Signatures
 When diagnosing anomalies from `telemetry/live_telemetry.csv` and `telemetry/current_status.json`, cross-correlate telemetry columns before modifying configurations:
@@ -644,6 +650,11 @@ def observation_window_scheduling_task(seed: int) -> TaskInstance:
     return task
 
 
+def science_store_forward_task(seed):
+    from .science_mission import science_store_forward_task as build_science
+    return build_science(seed)
+
+
 TASKS = {
     "eps_eclipse_recovery": eps_eclipse_recovery_task,
     "adcs_detumble_pointing": adcs_detumble_pointing_task,
@@ -653,6 +664,7 @@ TASKS = {
     "rf_energy_tradeoff": rf_energy_tradeoff_task,
     "early_pass_recovery": early_pass_recovery_task,
     "observation_window_scheduling": observation_window_scheduling_task,
+    "science_store_forward": science_store_forward_task,
 }
 
 DEMO_TASK = "eps_eclipse_recovery"

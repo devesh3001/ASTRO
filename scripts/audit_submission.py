@@ -12,7 +12,8 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from harness.tasks import TASKS, DEMO_TASK
-from package_submission import collect_evidence, fingerprints
+from package_submission import collect_evidence, fingerprints, contract_fingerprint, provenance_matches
+from harness.provenance import CONTRACT_VERSION
 
 
 def main():
@@ -51,6 +52,7 @@ def main():
     example = (ROOT/'.env.example').read_text(encoding='utf-8')
     add('Credential-free example', 'pass' if re.search(r'^API_KEY=\s*$', example, re.M) else 'fail', '.env.example has empty API_KEY')
     harness, sandbox = fingerprints()
+    runtime_contract = contract_fingerprint()
     try:
         gate, runs, success, failure = collect_evidence(ROOT/'logs')
         add('Current-code all-task baseline gate', 'pass', gate.name)
@@ -65,7 +67,7 @@ def main():
         with zipfile.ZipFile(archive) as bundle:
             manifest = json.loads(bundle.read('evidence-manifest.json'))
             assert manifest['team'] == args.team_name
-            assert manifest['harness_sha256'] == harness and manifest['sandbox_sha256'] == sandbox
+            assert provenance_matches(manifest, (harness, sandbox), runtime_contract)
             assert bundle.testzip() is None
             for name, expected in manifest['files'].items():
                 data = bundle.read(name)
@@ -123,7 +125,7 @@ def main():
     add('Hackathon timing and authorship', 'review', 'Team must attest eligibility and understand the implementation; commit times alone do not prove authorship', True)
     try:
         record = json.loads((ROOT/'submission_bundle/validation-evidence.json').read_text(encoding='utf-8'))
-        matched = (record.get('harness_sha256'), record.get('sandbox_sha256')) == (harness, sandbox)
+        matched = provenance_matches(record, (harness, sandbox), runtime_contract)
         passed = matched and record['linux_tests']['passed'] and record['live_security_tests']['passed'] and record['gate']['passed']
         add('Source-matched local runtime validation record', 'pass' if passed else 'fail',
             {'linux_tests':record['linux_tests'], 'live_security_tests':record['live_security_tests'], 'gate':record['gate']['run_id'],
@@ -134,7 +136,8 @@ def main():
     bad = any(r['status']=='fail' for r in rows)
     open_items = any(r['status'] not in ('pass',) for r in rows)
     result = {'overall_ps_compliance': 'NOT_COMPLETE' if bad or open_items else 'PASS',
-              'technical_evidence_failures': bad, 'harness_sha256': harness, 'sandbox_sha256': sandbox,
+              'technical_evidence_failures': bad, 'contract_version': CONTRACT_VERSION,
+              'harness_sha256': harness, 'sandbox_sha256': sandbox, 'runtime_contract_sha256': runtime_contract,
               'checks': rows, 'note':'Read-only audit; no model API calls, repository changes or form submission'}
     args.output.parent.mkdir(parents=True,exist_ok=True)
     args.output.write_text(json.dumps(result,indent=2),encoding='utf-8')

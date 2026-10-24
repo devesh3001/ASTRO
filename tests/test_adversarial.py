@@ -195,7 +195,8 @@ class TestSecurityAndIsolation(unittest.TestCase):
             "baudrate_bps": 9600.0,
         }
         frames = sim.advance(15 * 60.0, nominal_cfg, dt_s=60.0)
-        self.assertEqual(len(frames), 15)
+        self.assertEqual(len(frames), 30)
+        self.assertEqual([frame.time_s for frame in frames], list(range(30, 901, 30)))
         self.assertEqual(round(sim.time_s / 60.0, 1), 15.0)
         self.assertLess(sim.pointing_err_deg, 35.0)
 

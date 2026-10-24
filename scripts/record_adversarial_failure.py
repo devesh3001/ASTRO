@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from harness.provenance import CONTRACT_VERSION, contract_fingerprint
 from harness.agents import Reply, ToolCall
 from harness.env import Env
 from harness.runner import JsonlLog, Limits, run_episode
@@ -32,8 +33,8 @@ def main():
     out.mkdir(parents=True)
     harness, sandbox = fingerprints()
     model = "mock/adcs-relaxation-regression"
-    (out / "manifest.json").write_text(json.dumps({"contract_version": 2,
-        "harness_sha256": harness, "sandbox_sha256": sandbox, "model": model, "seed": 0,
+    (out / "manifest.json").write_text(json.dumps({"contract_version": CONTRACT_VERSION,
+        "runtime_contract_sha256":contract_fingerprint(), "harness_sha256": harness, "sandbox_sha256": sandbox, "model": model, "seed": 0,
         "evidence_role": "adversarial_regression", "description": "Executed scripted attack; not a real-model run"}, indent=2))
     env = Env("http://sandbox:8000")
     passed, rows = run_gate(env, ["adcs_detumble_pointing"], 0, out / "gate.jsonl")
