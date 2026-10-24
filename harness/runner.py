@@ -141,9 +141,14 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
         # keep every tool call in the history so each one gets a matching result
         assistant = {"role": "assistant", "content": reply.text}
         if reply.tool_calls:
-            assistant["tool_calls"] = [{"id": c.id, "type": "function",
-                                        "function": {"name": c.name, "arguments": c.history_arguments()}}
-                                       for c in reply.tool_calls]
+            calls_list = []
+            for c in reply.tool_calls:
+                c_dict = {"id": c.id, "type": "function",
+                          "function": {"name": c.name, "arguments": c.history_arguments()}}
+                if getattr(c, "extra_content", None):
+                    c_dict["extra_content"] = c.extra_content
+                calls_list.append(c_dict)
+            assistant["tool_calls"] = calls_list
         messages.append(assistant)
 
         if not reply.tool_calls:

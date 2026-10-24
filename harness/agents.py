@@ -8,6 +8,7 @@ class ToolCall:
     id: str
     name: str
     arguments: str          # raw text exactly as the model sent it
+    extra_content: dict = None
 
     def parse(self):
         """Return (args, error). `args` is a dict when the arguments are valid JSON."""
@@ -60,9 +61,11 @@ class OpenAIClient:
         calls = []
         for index, call in enumerate(message.tool_calls or []):
             function = getattr(call, "function", None)
+            extra_content = getattr(call, "extra_content", None)
             calls.append(ToolCall(id=call.id or f"call_{index}",
                                   name=(function.name if function else "") or "",
-                                  arguments=(function.arguments if function else "") or ""))
+                                  arguments=(function.arguments if function else "") or "",
+                                  extra_content=extra_content))
         usage = getattr(response, "usage", None)
         return Reply(text=message.content, tool_calls=calls, raw=response.model_dump_json(),
                      tokens=getattr(usage, "total_tokens", 0) or 0)
