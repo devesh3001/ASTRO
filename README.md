@@ -19,17 +19,18 @@ The default `MODEL=mock/solver` runs offline. Both baselines must pass before a 
 | `thermal_battery_preservation` | Medium | Recover safe battery temperature regulation |
 | `rf_downlink_closure` | Medium | Restore transmitter settings and repair the dynamic RF calculation |
 | `safe_mode_cascade` | Medium | Recover two seeded subsystem faults without an irreversible safety event |
+| `rf_energy_tradeoff` | Hard | Deliver a seeded payload within a short contact and RF energy allocation |
 
 **Run A demo:** `eps_eclipse_recovery`.
 
-The flight manual provides nominal operational guidance. `docs/mission.json` reports instance-specific success targets and fixed hardware properties. Seeds change faults, energy requirements and hardware/link profiles. Agent edits cannot change protected mission metadata.
+The flight manual provides nominal operational guidance. `docs/mission.json` reports instance-specific success targets and fixed hardware properties. Seeds change faults, energy requirements and hardware/link profiles. The hard mission also varies contact timing, duration, payload and radio energy allocation. Higher baud rates cost link margin; higher transmitter power costs energy. Nominal settings and maximum settings both fail its constraints. Agent edits cannot change protected mission metadata.
 
 ## Modes
 
 Set these values in `.env` (or use shell environment overrides):
 
 - `MODE=full`: baselines then model for `TASK_ID`.
-- `MODE=baselines`: baselines for all five tasks.
+- `MODE=baselines`: baselines for all six tasks.
 - `MODE=all`: all-task baselines then a model episode for each task.
 - `MODEL=mock/idle`: offline agent that immediately finishes, useful for failure-path checks.
 
@@ -37,7 +38,7 @@ Set these values in `.env` (or use shell environment overrides):
 
 ## State, actions and scoring
 
-State persists within an episode: elapsed orbital time, battery energy, temperature, scalar pointing error and downlinked data. Tools are `list_files`, `read_file`, `write_file`, `run_python`, `step_orbit` (1-30 minutes), and `finish`. Ordinary successful tool execution consumes 30 simulated seconds; the mission window is 95 simulated minutes. Initial telemetry is generated from the actual seeded simulator state.
+State persists within an episode: elapsed orbital time, battery energy, temperature, scalar pointing error and downlinked data. Tools are `list_files`, `read_file`, `write_file`, `run_python`, `step_orbit` (1-30 minutes), and `finish`. Ordinary successful tool execution consumes 30 simulated seconds; the mission window is 95 simulated minutes. Initial telemetry is generated from the actual seeded simulator state. `read_file` accepts character `offset` and `limit` (up to 3500) and reports the next offset for long files, so the complete manual is accessible without custom code.
 
 The raw score combines power (0.35), thermal behavior (0.25), pointing (0.20) and communications (0.20). Reported reward measures progress beyond the no-op world:
 
@@ -45,9 +46,9 @@ The raw score combines power (0.35), thermal behavior (0.25), pointing (0.20) an
 reward = clamp((raw_score - initial_raw_score) / (1 - initial_raw_score), 0, 1)
 ```
 
-Logs include both raw components and normalized progress. Catastrophic hardware safety events remain latched and yield zero. Success targets and hardware facts are protected; increasing an agent deadband cannot relax scoring. Configuration validation runs even when orbital time has ended. Reference >= 0.95 and no-op <= 0.05 are checked automatically.
+Logs include both raw components and normalized progress. Every required mission check must pass; a nearly met battery target cannot be offset by another score component. Failed required checks cap normalized reward below the success threshold. Final diagnostics name failed checks and report delivered data and RF energy use. Catastrophic hardware safety events remain latched and yield zero. Success targets and hardware facts are protected; increasing an agent deadband cannot relax scoring. Configuration validation runs even when orbital time has ended. Reference >= 0.95 and no-op <= 0.05 are checked automatically.
 
-The model is deliberately approximate: linear SoC/voltage, scalar attitude response, linearized heat loss and a baud-limited link-margin model. It does not claim three-axis rigid-body dynamics or flight certification.
+The model is deliberately approximate: linear SoC/voltage, scalar attitude response, linearized heat loss and a bandwidth-aware link-margin model. Integration splits at sunlight and contact boundaries, so tool timing cannot create extra contact time. It does not claim three-axis rigid-body dynamics or flight certification.
 
 ## Isolation and limits
 
@@ -55,7 +56,7 @@ The model is deliberately approximate: linear SoC/voltage, scalar attitude respo
 - Every tool/control endpoint requires the dynamically rotated harness token.
 - Agent code runs as UID 1001; evaluation scripts run as UID 1002. Identity lookup failures never fall back to root.
 - Worker processes, including detached descendants, are killed after every command and before reset.
-- The sandbox root filesystem is read-only. Workspace and temporary mounts have storage/inode bounds; workers have file, CPU, process, memory and output limits.
+- The sandbox root filesystem is read-only. Workspace and temporary mounts have storage/inode bounds; workers have file, CPU, memory and output limits. The container enforces a 128-process/thread cgroup limit, avoiding UID-wide process limits that can break on shared CI hosts.
 - Protected file access rejects symlinks, hard links and special files. The sandbox network has no external route.
 - Execution ends at 40 model replies or 600 seconds, whichever comes first. Each reply allows 10 tools; each complete tool operation has a 60-second deadline. Final verification has a separate 120-second budget. Baselines share 120 seconds per task.
 - Provider calls run in a cancellable process without hidden SDK retries. Received malformed replies count once and get corrective feedback. Context trimming conservatively bounds request size while retaining valid tool/result groups.
@@ -68,10 +69,10 @@ With Python dependencies installed, run:
 
 ```sh
 python tests/test_physics.py
-python -m unittest tests.test_adversarial tests.test_hardening tests.test_seeds_extended
+python -m unittest tests.test_adversarial tests.test_hardening tests.test_packaging tests.test_mission_planning tests.test_seeds_extended
 ```
 
-The seed suite checks actual reset hashes and both baselines across 100 task/seed combinations. For Linux UID/network/resource tests:
+The seed suite checks actual reset hashes and both baselines across 120 task/seed combinations (six tasks, seeds 0-19). Planning regressions additionally check 100 separate seeds (100-199) against nominal and maximum-radio shortcuts, exact contact capacity, alternative plans, and protected requirements. For Linux UID/network/resource tests:
 
 ```sh
 docker compose up -d sandbox
@@ -85,7 +86,15 @@ The runtime is pinned by image digest and Linux x86-64 wheel hashes in `requirem
 python scripts/check_cold_build.py
 ```
 
-CI runs integration regressions, all-task gates, an offline solver run and live sandbox checks, and uploads sanitized logs. Offline solver results validate plumbing; they are not real-model capability evidence.
+Compare four scripted policies through the HTTP environment on seeds separate from the integration suite:
+
+```sh
+python scripts/benchmark_policies.py
+```
+
+The report is written to `logs/benchmarks/policy-ablation.json`. It labels the reference policy as privileged and never calls a model API. It measures shortcut resistance, not language-model ability.
+
+CI runs integration regressions, this policy comparison, all-task gates, an offline solver run and live sandbox checks, and uploads sanitized logs. Offline solver results validate plumbing; they are not real-model capability evidence.
 
 ## Logs and submission
 

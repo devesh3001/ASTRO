@@ -1,4 +1,4 @@
-"""Reset hashes and both baselines across all 100 task/seed combinations."""
+"""Reset hashes and both baselines across all registered tasks and 20 seeds each."""
 import unittest
 from harness.tasks import TASKS
 from harness.agents import oracle_actions
@@ -6,7 +6,7 @@ from tests.support import environment
 
 
 class TestExtendedSeeds(unittest.TestCase):
-    def test_all_100_combinations(self):
+    def test_all_task_seed_combinations(self):
         with environment() as env:
             for task_id in TASKS:
                 for seed in range(20):

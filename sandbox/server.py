@@ -89,7 +89,16 @@ def tool_list_files(args):
 
 
 def tool_read_file(args):
-    return clip(runtime.read(WORKSPACE, args["path"]).decode("utf-8", errors="replace"))
+    offset, limit = args.get("offset", 0), args.get("limit", 3500)
+    if type(offset) is not int or not 0 <= offset <= MAX_FILE_BYTES:
+        raise ValueError("offset must be an integer between 0 and 250000")
+    if type(limit) is not int or not 1 <= limit <= 3500:
+        raise ValueError("limit must be an integer between 1 and 3500")
+    text = runtime.read(WORKSPACE, args["path"]).decode("utf-8", errors="replace")
+    content = text[offset:offset + limit]
+    if offset + len(content) < len(text):
+        content += f"\n[more: next_offset={offset + len(content)}, total_characters={len(text)}]"
+    return content
 
 
 def tool_write_file(args):

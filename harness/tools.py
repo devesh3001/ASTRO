@@ -7,10 +7,14 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {}, "required": []}}},
     {"type": "function", "function": {
         "name": "read_file",
-        "description": "Read a config file or telemetry log from the onboard filesystem.",
+        "description": "Read a config, manual or telemetry file. For long files, use the returned next_offset to read subsequent character ranges.",
         "parameters": {"type": "object", "required": ["path"], "properties": {
             "path": {"type": "string",
-                     "description": "Path relative to the onboard filesystem root."}}}}},
+                     "description": "Path relative to the onboard filesystem root."},
+            "offset": {"type": "integer", "minimum": 0, "maximum": 250000,
+                       "description": "Starting character offset, default 0."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 3500,
+                      "description": "Maximum characters to read, default 3500."}}}}},
     {"type": "function", "function": {
         "name": "write_file",
         "description": "Write a corrected config file or script to the onboard filesystem.",

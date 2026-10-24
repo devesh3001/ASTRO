@@ -12,13 +12,13 @@ It provides a single authoritative episode state tracking:
      and ground station pass closure.
 
 Unified Episode State Guarantee:
-Any irreversible catastrophic violation (e.g. bus collapse <= 3.10V, thermal runaway > 50Ã‚Â°C,
-freezing < -15Ã‚Â°C) is permanently latched for the entire episode and cannot be erased by
+Any irreversible catastrophic violation (e.g. bus collapse <= 3.10V, thermal runaway > 50 C,
+freezing < -15 C) is permanently latched for the entire episode and cannot be erased by
 modifying configuration files after the fact.
 
 Physical Channel Law Guarantee:
 Downlink data throughput is strictly calculated from configured baud rate and packet efficiency;
-no 8-minute ground pass can ever downlink more data than the physical channel capacity (<= 576 kB at 9600 bps).
+no 8-minute ground pass can ever downlink more data than the physical channel capacity (<= 489.6 kB at 9600 bps with 85% packet efficiency).
 """
 import math
 from dataclasses import dataclass, field
@@ -72,6 +72,7 @@ class SimulationResult:
     reward: Dict[str, float]
     frames: List[TelemetryFrame] = field(default_factory=list)
     failure_reason: str = ""
+    checks: Dict[str, bool] = field(default_factory=dict)
 
 
 # ---- 2. Physical Bounds Validation ------------------------------------
@@ -108,6 +109,15 @@ def validate_subsystem_configs(configs: Dict[str, Any]) -> Tuple[bool, str]:
     return True, ""
 
 
+def link_margin_db(configs, pointing_error_deg=0.0):
+    """Bandwidth-aware RF margin; the script reports the zero-pointing-loss value."""
+    return (configs.get("tx_power_dbm", 20.0) + configs.get("antenna_gain_dbi", 2.0)
+            + GROUND_STATION_RX_GAIN_DBI - configs.get("path_loss_db", 141.5)
+            - SYSTEM_LOSSES_DB - GROUND_RX_SENSITIVITY_DBM
+            - 10 * math.log10(configs.get("baudrate_bps", 9600.0) / 9600.0)
+            - min(20.0, (pointing_error_deg / 10.0) ** 2))
+
+
 # ---- 3. Authoritative Episode Multi-Physics Engine -------------------
 
 class AuthoritativeOrbitSimulator:
@@ -134,6 +144,7 @@ class AuthoritativeOrbitSimulator:
         self.wheel_bias_rpm: float = 0.0
         self.heater_on: bool = False
         self.total_downlinked_kb: float = 0.0
+        self.tx_energy_wh: float = 0.0
 
         # Trajectory extremes
         self.min_bus_v: float = 3.0 + 1.2 * (self.soc_wh / BATTERY_CAPACITY_WH)
@@ -147,16 +158,23 @@ class AuthoritativeOrbitSimulator:
         self.failure_reason: str = ""
         self.frames: List[TelemetryFrame] = []
 
+    def _validate(self, configs):
+        valid, reason = validate_subsystem_configs(configs)
+        for key in ("path_loss_db", "antenna_gain_dbi", "battery_capacity_wh", "frequency_mhz"):
+            if key in self.mission and configs.get(key) != self.mission[key]:
+                return False, f"Protected hardware parameter changed: {key}"
+        allowed = self.mission.get("allowed_baudrates_bps")
+        if allowed and configs.get("baudrate_bps", 9600.0) not in allowed:
+            return False, "Baud rate is not supported by the protected radio profile"
+        return valid, reason
+
     def advance(self, duration_s: float, configs: Dict[str, Any], dt_s: float = 60.0) -> List[TelemetryFrame]:
         """Advance authoritative orbit simulation by duration_s using current configs."""
         if duration_s <= 0:
             return []
 
         # Validate physical limits
-        valid, reason = validate_subsystem_configs(configs)
-        for key in ("path_loss_db", "antenna_gain_dbi", "battery_capacity_wh", "frequency_mhz"):
-            if key in self.mission and abs(configs.get(key, float("nan")) - self.mission[key]) > 1e-6:
-                valid, reason = False, f"Protected hardware parameter changed: {key}"
+        valid, reason = self._validate(configs)
         if not valid and not self.catastrophic_failure:
             self.catastrophic_failure = True
             self.failure_reason = f"Rejected unphysical configuration: {reason}"
@@ -172,21 +190,23 @@ class AuthoritativeOrbitSimulator:
         heater_hyst = configs.get("heater_hysteresis_c", 2.0)
         thermal_cut = configs.get("thermal_cutoff_temp", 35.0)
         tx_power = configs.get("tx_power_dbm", 20.0)
-        ant_gain = configs.get("antenna_gain_dbi", 2.0)
-        path_loss = configs.get("path_loss_db", 141.5)
         baudrate = configs.get("baudrate_bps", 9600.0)
 
         # Physical RF channel byte capacity per second: R_eff = (baudrate / 8) * packet_efficiency
         effective_kb_per_sec = ((baudrate / 8.0) * PACKET_EFFICIENCY) / 1000.0
 
-        steps = max(1, int(math.ceil(duration_s / dt_s)))
-        actual_dt = duration_s / steps
+        pass_start = self.mission.get("ground_pass_start_s", GROUND_PASS_START_S)
+        pass_end = pass_start + self.mission.get("ground_pass_duration_s", GROUND_PASS_DURATION_S)
+        end_s = min(ORBIT_PERIOD_S, self.time_s + duration_s)
         new_frames = []
 
-        for _ in range(steps):
+        while self.time_s < end_s - 1e-9:
             t = self.time_s
-            in_eclipse = (t % ORBIT_PERIOD_S) >= SUNLIGHT_PERIOD_S
-            in_ground_pass = (t >= GROUND_PASS_START_S) and (t < GROUND_PASS_START_S + GROUND_PASS_DURATION_S)
+            # Split at physical events, so partial tool steps cannot create extra contact time.
+            boundaries = [b for b in (SUNLIGHT_PERIOD_S, pass_start, pass_end, end_s) if b > t + 1e-9]
+            actual_dt = min(dt_s, min(boundaries) - t)
+            in_eclipse = t >= SUNLIGHT_PERIOD_S
+            in_ground_pass = pass_start <= t < pass_end
 
             # --------------------------------------------------------- 1. ADCS
             if abs(wheel_bias) > 20.0:
@@ -216,7 +236,9 @@ class AuthoritativeOrbitSimulator:
                 p_load += HEATER_POWER_W
             if in_ground_pass:
                 p_rf_w = (10.0 ** (tx_power / 10.0)) / 1000.0
-                p_load += TX_RF_LOAD_POWER_W + p_rf_w * 2.0
+                tx_load = TX_RF_LOAD_POWER_W + p_rf_w * 2.0
+                p_load += tx_load
+                self.tx_energy_wh += tx_load * actual_dt / 3600.0
 
             # Battery Energy Update
             net_power = p_gen - p_load
@@ -251,14 +273,7 @@ class AuthoritativeOrbitSimulator:
                     self.failure_reason = f"Irreversible attitude tumble (pointing error {self.pointing_err_deg:.1f} deg)"
 
             # --------------------------------------------------------- 4. COMMS
-            antenna_pointing_loss = min(20.0, (self.pointing_err_deg / 10.0) ** 2)
-            link_margin = (
-                (tx_power + ant_gain + GROUND_STATION_RX_GAIN_DBI)
-                - path_loss
-                - SYSTEM_LOSSES_DB
-                - GROUND_RX_SENSITIVITY_DBM
-                - antenna_pointing_loss
-            )
+            link_margin = link_margin_db(configs, self.pointing_err_deg)
 
             if in_ground_pass:
                 self.min_link_margin_db = min(self.min_link_margin_db, link_margin)
@@ -295,10 +310,7 @@ class AuthoritativeOrbitSimulator:
         self.time_s = ORBIT_PERIOD_S
 
         # Validate even when no simulation time remains. Hardware facts are immutable.
-        valid, reason = validate_subsystem_configs(configs)
-        for key in ("path_loss_db", "antenna_gain_dbi", "battery_capacity_wh", "frequency_mhz"):
-            if key in self.mission and abs(configs.get(key, float("nan")) - self.mission[key]) > 1e-6:
-                valid, reason = False, f"Protected hardware parameter changed: {key}"
+        valid, reason = self._validate(configs)
         if not valid:
             return SimulationResult(False, {"power_balance": 0.0, "thermal_stability": 0.0,
                 "adcs_precision": 0.0, "comms_closure": 0.0, "total": 0.0}, self.frames, reason)
@@ -338,20 +350,35 @@ class AuthoritativeOrbitSimulator:
         elif self.pointing_err_deg <= 10.0:
             adcs_score = 0.10 * clamp((10.0 - self.pointing_err_deg) / (10.0 - target_pointing))
 
-        # 4. Comms Closure (0.20) - Recalibrated to physical channel capacity (<= 576 kB)
+        # Communications credit is bounded by physical payload delivery, not script output.
         # Verify script correctness independently of accumulated communication credit (Item 1)
         script_verified = configs.get("script_verified", True)
         comms_score = 0.0
-        if self.task_id in ("rf_downlink_closure", "safe_mode_cascade") and not script_verified:
+        target_data = self.mission.get("required_downlink_kb", 350.0)
+        if not script_verified:
             comms_score = 0.0
             self.total_downlinked_kb = 0.0
-        elif self.min_link_margin_db >= 3.0 and self.total_downlinked_kb >= 350.0:
+        elif self.min_link_margin_db >= 3.0 and self.total_downlinked_kb >= target_data:
             comms_score = 0.20
-        elif self.min_link_margin_db >= 0.0 and self.total_downlinked_kb >= 100.0:
+        elif self.min_link_margin_db >= 0.0 and self.total_downlinked_kb >= min(100.0, target_data):
             comms_score = 0.10
 
+        energy_ok = self.tx_energy_wh <= self.mission.get("max_tx_energy_wh", float("inf")) + 1e-9
+        if not energy_ok:
+            power_score = 0.0
+        checks = {
+            "battery_reserve": final_soc_pct >= target_soc and self.min_bus_v >= uv_thresh and uv_thresh >= 3.15,
+            "thermal_limits": (self.min_temp_c >= self.mission.get("min_battery_temp_c", 0)
+                               and self.max_temp_c <= self.mission.get("max_battery_temp_c", 42)
+                               and self.temp_c <= self.mission.get("max_final_temp_c", 32)),
+            "pointing_target": self.pointing_err_deg <= target_pointing and abs(wheel_bias) < 5,
+            "payload_target": self.total_downlinked_kb >= target_data,
+            "contact_link_margin": self.min_link_margin_db >= 3,
+            "link_script_behavior": bool(script_verified),
+            "rf_energy_allocation": energy_ok,
+        }
         total_reward = round(power_score + thermal_score + adcs_score + comms_score, 4)
-        passed = total_reward >= 0.95
+        passed = total_reward >= 0.95 and all(checks.values())
 
         return SimulationResult(
             passed=passed,
@@ -363,7 +390,8 @@ class AuthoritativeOrbitSimulator:
                 "total": total_reward,
             },
             frames=self.frames,
-            failure_reason="",
+            failure_reason="; ".join(name for name, ok in checks.items() if not ok),
+            checks=checks,
         )
 
 

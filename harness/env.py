@@ -22,6 +22,7 @@ from .verifier import (
     AuthoritativeOrbitSimulator,
     BATTERY_CAPACITY_WH,
     SimulationResult,
+    link_margin_db,
 )
 
 PASS_SCORE = 0.95   # physical orbit survival & mission completion threshold
@@ -168,8 +169,9 @@ class Env:
                 "battery_soc_pct": round(self.sim.soc_wh / BATTERY_CAPACITY_WH * 100, 1),
                 "battery_temp_c": self.sim.temp_c, "pointing_error_deg": error,
                 "heater_active": False,
-                "link_margin_db": round(configs["tx_power_dbm"] + configs["antenna_gain_dbi"] + 16
-                    - configs["path_loss_db"] - 2.5 + 100 - min(20, (error / 10) ** 2), 1)}
+                "pass_active": False, "data_downlinked_kb": 0.0, "tx_energy_wh": 0.0,
+                "link_margin_db": round(link_margin_db(configs, error), 1)}
+
 
     def _sync_sim_telemetry(self, frames: list):
         """Update current_status.json and live_telemetry.csv in sandbox after physics evolution."""
@@ -185,6 +187,9 @@ class Env:
             "pointing_error_deg": last_frame.pointing_error_deg,
             "heater_active": last_frame.heater_active,
             "link_margin_db": last_frame.link_margin_db,
+            "pass_active": last_frame.pass_active,
+            "data_downlinked_kb": last_frame.data_downlinked_kb,
+            "tx_energy_wh": round(self.sim.tx_energy_wh, 5),
         }
         csv_lines = "".join(
             f"{round(f.time_s/60.0, 1)},{'ECLIPSE' if f.eclipse else 'SUNLIGHT'},"
@@ -235,7 +240,7 @@ class Env:
                     f"Orbit advanced by {actual_min} min (MET: {round(self.sim.time_s/60.0, 1)} min, "
                     f"Phase: {'ECLIPSE' if last_frame.eclipse else 'SUNLIGHT'}).\n"
                     f"Status: Bus={last_frame.bus_voltage_v}V, Battery SoC={last_frame.battery_soc_pct}%, "
-                    f"Temp={last_frame.battery_temp_c}Â°C, Pointing Err={last_frame.pointing_error_deg}Â°, "
+                    f"Temp={last_frame.battery_temp_c} C, Pointing Err={last_frame.pointing_error_deg} degrees, "
                     f"Link Margin={last_frame.link_margin_db} dB (Heater: {'ON' if last_frame.heater_active else 'OFF'}).\n"
                     f"Updated telemetry in telemetry/live_telemetry.csv and telemetry/current_status.json"
                 )
@@ -268,6 +273,7 @@ class Env:
                 "temp_c": round(self.sim.temp_c, 3),
                 "pointing_err_deg": round(self.sim.pointing_err_deg, 3),
                 "downlinked_kb": round(self.sim.total_downlinked_kb, 3),
+                "tx_energy_wh": round(self.sim.tx_energy_wh, 6),
                 "catastrophic_failure": bool(self.sim.catastrophic_failure),
                 "failure_reason": str(self.sim.failure_reason),
                 "heater_on": bool(self.sim.heater_on),
@@ -295,7 +301,7 @@ class Env:
         configs = self._parse_subsystem_configs(files)
 
         # Dynamic behavioural verification of link budget script on unprivileged sandbox worker
-        if self.task and self.task.task_id in ("rf_downlink_closure", "safe_mode_cascade"):
+        if self.task and "scripts/link_budget.py" in self.task.files:
             if "scripts/link_budget.py" in self.task.files or "scripts/link_budget.py" in files:
                 script_content = files.get("scripts/link_budget.py", "")
                 script_hash = hashlib.sha256(script_content.encode("utf-8")).hexdigest()
@@ -313,9 +319,11 @@ class Env:
                         t_tx = round(rng.uniform(22.0, 32.0), 1)
                         t_gain = round(rng.uniform(5.0, 15.0), 1)
                         t_loss = round(rng.uniform(130.0, 150.0), 1)
-                        cfg_str = f"[comms]\ntx_power_dbm = {t_tx}\nantenna_gain_dbi = {t_gain}\npath_loss_db = {t_loss}\n"
+                        t_rate = rng.choice([4800, 9600, 19200, 38400])
+                        cfg_str = f"[comms]\ntx_power_dbm = {t_tx}\nantenna_gain_dbi = {t_gain}\npath_loss_db = {t_loss}\nbaudrate_bps = {t_rate}\n"
                         test_cases.append({"subsystems/comms.cfg": cfg_str})
-                        exp_m = round((t_tx + t_gain + 16.0) - t_loss - 2.5 - (-100.0), 2)
+                        exp_m = round(link_margin_db({"tx_power_dbm": t_tx, "antenna_gain_dbi": t_gain,
+                                                            "path_loss_db": t_loss, "baudrate_bps": t_rate}), 2)
                         expected_margins.append(exp_m)
 
                     eval_payload = {
@@ -351,12 +359,16 @@ class Env:
         raw = sim_result.reward
         baseline_total = self.baseline["total"] if self.baseline else 0.0
         progress = max(0.0, min(1.0, (raw["total"] - baseline_total) / max(0.0001, 1.0 - baseline_total)))
+        if not sim_result.passed:
+            progress = min(progress, 0.94)
         keys = ("power_balance", "thermal_stability", "adcs_precision", "comms_closure")
         gains = {key: max(0.0, raw[key] - (self.baseline[key] if self.baseline else 0.0)) for key in keys}
         gain_sum = sum(gains.values())
         result = {key: round(progress * gains[key] / gain_sum, 6) if gain_sum else 0.0 for key in keys}
         result.update(total=round(progress, 6), raw_components=raw, baseline_total=baseline_total)
-        self.last_verifier = {"passed": progress >= PASS_SCORE, "failure_reason": sim_result.failure_reason,
+        self.last_verifier = {"passed": sim_result.passed and progress >= PASS_SCORE, "failure_reason": sim_result.failure_reason,
+                              "checks": sim_result.checks,
+                              "tx_energy_wh": round(sim_eval.tx_energy_wh, 5),
                               "projected": True, "final_soc_pct": round(sim_eval.soc_wh / BATTERY_CAPACITY_WH * 100, 3),
                               "final_pointing_deg": round(sim_eval.pointing_err_deg, 3),
                               "downlinked_kb": round(sim_eval.total_downlinked_kb, 3)}

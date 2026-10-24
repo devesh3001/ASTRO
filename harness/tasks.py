@@ -1,17 +1,19 @@
 """Satellite fault-response tasks for AeroSentinel with realistic physics grounding.
 
 Key improvements:
-- Zero answer leakage: Task descriptions report symptoms, alarms, and flight telemetry,
-  NOT the solution parameter values.
+- Guided recovery tasks expose a nominal engineering manual; the hard contact mission
+  requires instance-specific planning beyond those nominal settings.
 - Engineering manual provided: `docs/flight_manual.md` details nominal operational
   bounds, equations, and diagnostic guidelines.
 - Dynamic seed variety: Seeds alter orbital initial conditions, telemetry noise,
   and fault profiles while maintaining guaranteed solvability for reference solutions.
-- Five tasks across two difficulty levels:
+- Six tasks across three difficulty levels:
   * easy   : eps_eclipse_recovery, adcs_detumble_pointing
   * medium : thermal_battery_preservation, rf_downlink_closure, safe_mode_cascade
+  * hard   : rf_energy_tradeoff
 """
 import random
+import math
 from dataclasses import dataclass, field
 import json
 from typing import Dict, List
@@ -37,14 +39,14 @@ class TaskInstance:
 
 FLIGHT_MANUAL_MD = """\
 # AEROSENTINEL-3U CUBESAT FLIGHT SOFTWARE MANUAL
-**Document Ref:** AS3U-FSW-OPS-v2.5
-**Orbit Specification:** 500 km Circular LEO, Period = 95 min (60 min sun, 35 min eclipse)
+**Document Ref:** AS3U-FSW-OPS-v3.0
+**Orbit Specification:** 500 km Circular LEO, Period = 95 min (60 min sun, 35 min eclipse). Contact timing is mission-specific.
 
 ---
 
 ## 1. Electrical Power Subsystem (EPS)
-- **Solar Array:** Triple-junction GaAs deployable panels (Total Area = 0.06 mÂ², nominal cell efficiency = 28%).
-  - Maximum Power Point Tracking (MPPT) software calibration: `solar_efficiency = 0.72` (Nominal operational band: 0.70 â€“ 0.75).
+- **Solar Array:** Triple-junction GaAs deployable panels (Total Area = 0.06 m2, nominal cell efficiency = 28%).
+  - Maximum Power Point Tracking (MPPT) software calibration: `solar_efficiency = 0.72` (Nominal operational band: 0.70 - 0.75).
   - Software calibration below 0.50 causes acute solar power deficit, leading to battery brownout during eclipse.
   - Solar generation formula: `P_gen = solar_efficiency * 0.28 * 0.06 * 1361.0 * cos(theta_sun)` (Watts).
 - **Battery Pack:** 3S2P Li-ion (Nominal voltage 3.7V equivalent, 40.0 Wh capacity).
@@ -57,28 +59,34 @@ FLIGHT_MANUAL_MD = """\
   - Nominal steady-state wheel bias: `wheel_bias_rpm = 0` (Residual momentum bias causes continuous attitude precession).
   - Fine pointing deadband: `pointing_deadband_deg = 0.05` degrees.
   - Control loop proportional gain: `control_gain = 2.0` (Gains below 1.0 result in underdamped sluggish pointing).
-  - Nominal 3-axis pointing requirement: <= 5.0 degrees off-sun during generation phase.
+  - The simulator tracks one scalar pointing error. Final pointing must meet `required_pointing_deg` in `docs/mission.json` (normally 0.15 degrees).
 
 ## 3. Thermal Control Subsystem (TCS)
 - **Operational Temperature Limits:**
-  - Li-ion battery pack safe operating range: 0Â°C to +35Â°C.
-  - Critical thermal runaway threshold: > 50Â°C (irreversible cell venting/degradation).
-  - Freezing floor: < -15Â°C (electrolyte freezing).
+  - Nominal battery temperature range: 0 C to +35 C. Recovery scoring checks the entire trajectory against the mission temperature bounds and the final temperature ceiling in `docs/mission.json`.
+  - Critical thermal runaway threshold: > 50 C (irreversible cell venting/degradation).
+  - Freezing floor: < -15 C (electrolyte freezing).
 - **Thermostat Parameters:**
-  - Nominal battery heater setpoint: `battery_heater_setpoint = 15.0` Â°C.
-  - Thermostat hysteresis: `heater_hysteresis_c = 2.0` Â°C (Turns ON at setpoint - hysteresis, OFF at setpoint).
-  - Thermal safety upper cutoff: `thermal_cutoff_temp = 45.0` Â°C (Emergency override to prevent runaway).
+  - Nominal battery heater setpoint: `battery_heater_setpoint = 15.0` C.
+  - Thermostat hysteresis: `heater_hysteresis_c = 2.0` C (Turns ON at setpoint - hysteresis, OFF at setpoint).
+  - Thermal safety upper cutoff: `thermal_cutoff_temp = 45.0` C (Emergency override to prevent runaway).
 
 ## 4. Communications Subsystem (COMMS)
 - **Transceiver:** UHF direct-to-ground downlink at 437.5 MHz (500 km LEO orbit).
-  - Nominal RF output power: `tx_power_dbm = 30.0` dBm (1.0 Watt). Operational band: 28.0 to 32.0 dBm.
+  - Nominal RF output power: `tx_power_dbm = 30.0` dBm (1.0 Watt). Nominal band: 28.0 to 32.0 dBm; the simulator permits -10 to 36 dBm, subject to mission energy constraints.
   - High-gain patch antenna: `antenna_gain_dbi = 8.0` dBi. Operational band: 6.0 to 10.0 dBi.
   - 500 km LEO slant-range Free Space Path Loss (FSPL): `path_loss_db = 141.5` dB.
   - Ground Station Parameters: Receiver Gain `G_rx = 16.0` dBi, System Losses `L_sys = 2.5` dB, Demodulator Sensitivity `P_sens = -100.0` dBm.
   - Friis Link Margin Equation:
-    `Margin (dB) = (tx_power_dbm + antenna_gain_dbi + 16.0) - path_loss_db - 2.5 - (-100.0)`
+    `Margin (dB) = tx_power_dbm + antenna_gain_dbi + 16 - path_loss_db - 2.5 + 100 - 10*log10(baudrate_bps/9600) - pointing_loss_db`
   - Required operational link margin for telemetry packet lock: >= 3.0 dB.
-  - Link budget scripts must dynamically query `path_loss_db` from `subsystems/comms.cfg`.
+  - Pointing loss: `min(20, (pointing_error_deg/10)**2)` dB. `calc_margin()` reports the zero-pointing-loss budget; live telemetry includes pointing loss.
+  - Link budget scripts must read path loss and baud rate from `subsystems/comms.cfg` (baud rate defaults to 9600 if absent).
+  - Higher baud rate raises receiver noise bandwidth: sensitivity penalty = `10*log10(baudrate_bps/9600)` dB.
+  - Delivered payload = `baudrate_bps/8 * 0.85 / 1000 * contact_seconds` kB at margin >= 3 dB; 50% delivery at 0-3 dB.
+  - Transmitter bus load during contact = `8 + 2*10**(tx_power_dbm/10)/1000` W. RF energy is its time integral in Wh.
+  - Hard missions publish a contact window, payload target, allowed baud rates and RF energy allocation in `docs/mission.json`. These take precedence over nominal bench settings; copying the nominal configuration is insufficient.
+  - Every required outcome must pass. A missed payload or energy allocation cannot be offset by other subsystem scores.
 
 ---
 
@@ -86,12 +94,12 @@ FLIGHT_MANUAL_MD = """\
 When diagnosing anomalies from `telemetry/live_telemetry.csv` and `telemetry/current_status.json`, cross-correlate telemetry columns before modifying configurations:
 
 1. **Low Bus Voltage / Rapid Eclipse Drain:**
-   - *Check ADCS first:* If `pointing_err_deg` > 20Â°, off-sun tumble is causing panel cosine illumination loss, starving generation. Neutralize reaction wheel momentum bias (`wheel_bias_rpm = 0`) and tighten deadband.
-   - *Check EPS MPPT:* If pointing is nominal (<= 5Â°) but `bus_v` steadily degrades during sunlight, MPPT `solar_efficiency` has drifted below nominal (0.70 - 0.75).
-   - *Check TCS Heater Load:* If `heater = ON` continuously even when core temp > 20Â°C, stuck heater consumes 2.5W baseline load, accelerating battery depletion.
+   - *Check ADCS first:* If `pointing_err_deg` > 20 degrees, off-sun tumble is causing panel cosine illumination loss, starving generation. Neutralize reaction wheel momentum bias (`wheel_bias_rpm = 0`) and tighten deadband.
+   - *Check EPS MPPT:* If pointing is nominal (<= 5 degrees) but `bus_v` steadily degrades during sunlight, MPPT `solar_efficiency` has drifted below nominal (0.70 - 0.75).
+   - *Check TCS Heater Load:* If `heater = ON` continuously even when core temp > 20 C, stuck heater adds 6.0 W to the 4.5 W baseline load, accelerating battery depletion.
 
 2. **Battery Temperature Elevation / Thermal Warning:**
-   - Inspect `battery_heater_setpoint` vs `live_telemetry.csv` temp trend. If setpoint exceeds 30Â°C, the thermostat will drive cells toward the 50Â°C catastrophic runaway limit. Reconfigure setpoint to 15.0Â°C and cutoff to 45.0Â°C.
+   - Inspect `battery_heater_setpoint` vs `live_telemetry.csv` temp trend. If setpoint exceeds 30 C, the thermostat will drive cells toward the 50 C catastrophic runaway limit. Reconfigure setpoint to 15.0 C and cutoff to 45.0 C.
 
 3. **Loss of Telemetry / Blackout During Pass:**
    - Verify link margin in `telemetry/current_status.json`. If negative or below 3.0 dB, check transceiver TX power (must be >= 28.0 dBm) and run `scripts/link_budget.py` to ensure it dynamically queries `path_loss_db` rather than using stale bench-test constants.
@@ -138,6 +146,7 @@ baudrate_bps = 9600
 _LINK_BUDGET_SCRIPT_FIXED = '''\
 """Dynamic Link Budget Calculator for AeroSentinel UHF/S-band."""
 import configparser
+import math
 from pathlib import Path
 
 
@@ -152,10 +161,11 @@ def calc_margin():
     tx_power = float(cfg['comms']['tx_power_dbm'])
     gain = float(cfg['comms']['antenna_gain_dbi'])
     path_loss = float(cfg['comms']['path_loss_db'])
+    baudrate = cfg.getfloat('comms', 'baudrate_bps', fallback=9600.0)
 
     # Friis Link Equation: Margin (dB) = P_tx + G_tx + G_rx - Path_Loss - L_sys - P_sens
     # Ground Station: G_rx = 16.0 dBi, P_sens = -100.0 dBm, L_sys = 2.5 dB
-    margin = (tx_power + gain + 16.0) - path_loss - 2.5 - (-100.0)
+    margin = (tx_power + gain + 16.0) - path_loss - 2.5 + 100.0 - 10.0 * math.log10(baudrate / 9600.0)
     return round(margin, 2)
 
 
@@ -332,7 +342,7 @@ timestamp,zone,temp_c,heater_status,bus_current_a
 
     instructions = (
         "CRITICAL ALERT [TCS-THM-501]: Battery thermal zone reports rapid uncontrolled temperature rise "
-        "exceeding safe limits (approaching 50Â°C runaway threshold) due to an erroneous heater setpoint. "
+        "exceeding safe limits (approaching 50 C runaway threshold) due to an erroneous heater setpoint. "
         "Review `telemetry/thermal_log.csv` and `docs/flight_manual.md` for thermal constraints. "
         "Reconfigure `subsystems/thermal.cfg` with nominal setpoint and emergency cutoff temperatures "
         "to prevent catastrophic battery thermal failure."
@@ -517,12 +527,58 @@ baudrate_bps = 9600
 
 # ---- 9. Registry & Selector -------------------------------------------
 
+
+def rf_energy_tradeoff_task(seed: int) -> TaskInstance:
+    """A contact-planning problem with competing payload, link and energy constraints."""
+    rng = random.Random(seed ^ 0xC04AC7)
+    duration = rng.choice([240, 300, 360])
+    start = rng.choice([4020, 4200, 4440])
+    path_loss = round(rng.uniform(142.0, 145.5), 2)
+    gain = round(rng.uniform(7.0, 9.0), 2)
+    rate = rng.choice([19200, 38400])
+    payload = round(rate / 8 * 0.85 / 1000 * duration * 0.94, 1)
+    # A feasible reference is derived from this instance's RF budget. Other plans are accepted.
+    minimum_tx = 3 + path_loss - gain - 113.5 + 10 * math.log10(rate / 9600)
+    tx = math.ceil((minimum_tx + 0.15) * 10) / 10
+    allocation = round((8 + 2 * 10 ** (tx / 10) / 1000) * duration / 3600 * 1.04, 5)
+    reference_comms = _COMMS_CFG_NOMINAL.replace('tx_power_dbm = 30.0', f'tx_power_dbm = {tx}').replace('baudrate_bps = 9600', f'baudrate_bps = {rate}')
+    return TaskInstance(
+        task_id='rf_energy_tradeoff',
+        title='Short Contact: Payload and RF Energy Allocation',
+        difficulty='hard',
+        instructions=(
+            'CONTACT PLANNING ALERT [COMMS-PLAN-612]: The next station contact is shorter than '
+            'the nominal pass and has a strict RF energy allocation. The queued payload must be '
+            'delivered during that contact while preserving battery, thermal and pointing safety. '
+            'Read docs/mission.json and the radio equations in docs/flight_manual.md. '
+            'Diagnose scripts/link_budget.py, choose a feasible baud rate and transmitter power, '
+            'and repair subsystems/comms.cfg. Check both throughput and energy; a high link margin '
+            'alone does not complete this mission.'),
+        files={
+            'docs/flight_manual.md': FLIGHT_MANUAL_MD,
+            'subsystems/eps.cfg': _EPS_CFG_NOMINAL,
+            'subsystems/adcs.cfg': _ADCS_CFG_NOMINAL,
+            'subsystems/thermal.cfg': _THERMAL_CFG_NOMINAL,
+            'subsystems/comms.cfg': _COMMS_CFG_NOMINAL,
+            'scripts/link_budget.py': _LINK_BUDGET_SCRIPT_BUGGY,
+        },
+        reference={'subsystems/comms.cfg': reference_comms,
+                   'scripts/link_budget.py': _LINK_BUDGET_SCRIPT_FIXED},
+        initial_soc_pct=75.0, initial_temp_c=12.0, initial_pointing_error_deg=5.0,
+        mission={'path_loss_db': path_loss, 'antenna_gain_dbi': gain,
+                 'ground_pass_start_s': start, 'ground_pass_duration_s': duration,
+                 'required_downlink_kb': payload, 'max_tx_energy_wh': allocation,
+                 'allowed_baudrates_bps': [1200, 2400, 4800, 9600, 19200, 38400]},
+    )
+
+
 TASKS = {
     "eps_eclipse_recovery": eps_eclipse_recovery_task,
     "adcs_detumble_pointing": adcs_detumble_pointing_task,
     "thermal_battery_preservation": thermal_battery_preservation_task,
     "rf_downlink_closure": rf_downlink_closure_task,
     "safe_mode_cascade": safe_mode_cascade_task,
+    "rf_energy_tradeoff": rf_energy_tradeoff_task,
 }
 
 DEMO_TASK = "eps_eclipse_recovery"
@@ -540,6 +596,13 @@ def build_task(task_id: str, seed: int) -> TaskInstance:
         "frequency_mhz": 437.5,
         "min_final_soc_pct": round(rng.uniform(82.0, 86.0), 1) if task_id == "eps_eclipse_recovery" else 50.0,
         "required_pointing_deg": 0.15,
+        "min_battery_temp_c": 0.0,
+        "max_battery_temp_c": 42.0,
+        "max_final_temp_c": 32.0,
+        "ground_pass_start_s": 4200,
+        "ground_pass_duration_s": 480,
+        "required_downlink_kb": 350.0,
+        **task.mission,
     }
     # Gain and propagation loss are hardware facts, not flight-software repair knobs.
     for mapping in (task.files, task.reference):
