@@ -4,5 +4,6 @@ __pycache__/
 *.pyo
 logs/*/
 !logs/.gitkeep
-submission_bundle/
 .workspace/
+bundle_staging/
+*.zip

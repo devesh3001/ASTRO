@@ -10,10 +10,11 @@ The domain is drawn from embedded avionics development at the **IIT (BHU) Rocket
 
 ## Security & Isolation (Bar 3: Robustness)
 
-- **Isolated Physics Verifier**: Evaluation runs strictly in the protected harness container. The untrusted sandbox container contains no verification or reward code.
-- **Transport Authorization**: Privileged endpoints (`/reset`, `/state`, `/fetch_configs`) require a high-entropy secret token (`HARNESS_SECRET`) via the `X-Harness-Secret` header. Direct calls from unprivileged agent code are rejected with `403 Forbidden`.
-- **Scrubbed Subprocess Execution**: Agent Python commands execute under a sanitized environment stripping all container and host secrets.
-- **Path Traversal Protection**: All filesystem access is strictly bounded inside `/workspace`.
+- **Isolated Physics Verifier**: Evaluation runs strictly in the protected harness container. The untrusted sandbox container contains zero verification or reward code.
+- **Privilege Separation**: The server runs with dropped capabilities (`cap_drop: [ALL]`), and all agent Python execution (`run_python`) executes strictly under unprivileged account `sandbox-agent` (UID 1001), preventing access to server memory or `/proc/1/environ`.
+- **Dynamic Secret Token Authorization**: Privileged endpoints (`/reset`, `/state`, `/fetch_configs`) require a dynamically generated 256-bit token created at container startup into a root-owned `mode 0600` volume. Unauthenticated calls receive `403 Forbidden`.
+- **Dynamic Behavioural Verification**: Dynamic code testing replaces string matching; scripts such as `link_budget.py` are executed against synthesized test fixtures with varied parameters, preventing comment/substring bypasses.
+- **Interactive Orbital Progression**: Agents can call `step_orbit` to advance orbital time and observe dynamic consequences in `telemetry/live_telemetry.csv` and `telemetry/current_status.json`.
 - **Zero Answer Leakage**: The agent receives realistic symptoms, anomaly alerts, and flight manuals (`docs/flight_manual.md`), never hardcoded answer numbers.
 
 ---

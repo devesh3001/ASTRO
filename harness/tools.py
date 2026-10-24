@@ -20,6 +20,13 @@ TOOLS = [
             "content": {"type": "string",
                         "description": "Full new contents of the file."}}}}},
     {"type": "function", "function": {
+        "name": "step_orbit",
+        "description": "Advance satellite orbital simulation by a given duration (1-30 minutes) to observe dynamic telemetry consequences of current subsystem configurations.",
+        "parameters": {"type": "object", "properties": {
+            "minutes": {"type": "integer",
+                        "description": "Number of orbital minutes to advance (default 10, between 1 and 30)."}},
+            "required": []}}},
+    {"type": "function", "function": {
         "name": "run_python",
         "description": "Run a Python snippet in the onboard filesystem to test a fix or inspect state.",
         "parameters": {"type": "object", "required": ["code"], "properties": {
@@ -46,6 +53,10 @@ def check_args(name, args):
     for key, value in args.items():
         if key not in spec["properties"]:
             return f"unexpected argument '{key}'"
-        if not isinstance(value, str):
+        expected_type = spec["properties"][key].get("type", "string")
+        if expected_type == "integer":
+            if not isinstance(value, int) and not (isinstance(value, str) and value.isdigit()):
+                return f"argument '{key}' must be an integer"
+        elif not isinstance(value, str):
             return f"argument '{key}' must be a string"
     return None

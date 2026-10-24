@@ -27,24 +27,25 @@ class TaskInstance:
     files: Dict[str, str]       # workspace files provided to the agent
     reference: Dict[str, str]   # corrected files that achieve full mission success
     initial_soc_pct: float = 75.0
-    initial_temp_c: float = 12.0
-    initial_pointing_error_deg: float = 40.0
+    initial_temp_c: float = 14.0
+    initial_pointing_error_deg: float = 35.0
 
 
 # ---- 2. CubeSat Flight Manual (docs/flight_manual.md) ------------------
 
 FLIGHT_MANUAL_MD = """\
 # AEROSENTINEL-3U CUBESAT FLIGHT SOFTWARE MANUAL
-**Document Ref:** AS3U-FSW-OPS-v2.4
+**Document Ref:** AS3U-FSW-OPS-v2.5
 **Orbit Specification:** 500 km Circular LEO, Period = 95 min (60 min sun, 35 min eclipse)
 
 ---
 
 ## 1. Electrical Power Subsystem (EPS)
-- **Solar Array:** Triple-junction GaAs deployable panels (Area = 0.06 m²).
-  - Nominal calibration solar cell efficiency: `solar_efficiency = 0.72` (Valid operational band: 0.70 – 0.75).
-  - Miscalibration below 0.50 causes severe power deficit during sunlight, leading to battery depletion in eclipse.
-- **Battery Pack:** 3S2P Li-ion (Nominal voltage 3.7V equivalent, 40 Wh capacity).
+- **Solar Array:** Triple-junction GaAs deployable panels (Total Area = 0.06 m², nominal cell efficiency = 28%).
+  - Maximum Power Point Tracking (MPPT) software calibration: `solar_efficiency = 0.72` (Nominal operational band: 0.70 – 0.75).
+  - Software calibration below 0.50 causes acute solar power deficit, leading to battery brownout during eclipse.
+  - Solar generation formula: `P_gen = solar_efficiency * 0.28 * 0.06 * 1361.0 * cos(theta_sun)` (Watts).
+- **Battery Pack:** 3S2P Li-ion (Nominal voltage 3.7V equivalent, 40.0 Wh capacity).
   - Hardware critical collapse floor: 3.10 V.
   - Required software undervoltage cutoff: `undervoltage_threshold = 3.20` V. Setting this below 3.00 V risks unrecoverable bus collapse during peak eclipse load.
   - Maximum safe charge current: `max_charge_rate_a = 1.2` A.
@@ -54,26 +55,27 @@ FLIGHT_MANUAL_MD = """\
   - Nominal steady-state wheel bias: `wheel_bias_rpm = 0` (Residual momentum bias causes continuous attitude precession).
   - Fine pointing deadband: `pointing_deadband_deg = 0.05` degrees.
   - Control loop proportional gain: `control_gain = 2.0` (Gains below 1.0 result in underdamped sluggish pointing).
-  - Nominal 3-axis pointing requirement: ≤ 5.0 degrees off-sun during generation phase.
+  - Nominal 3-axis pointing requirement: <= 5.0 degrees off-sun during generation phase.
 
 ## 3. Thermal Control Subsystem (TCS)
 - **Operational Temperature Limits:**
   - Li-ion battery pack safe operating range: 0°C to +35°C.
   - Critical thermal runaway threshold: > 50°C (irreversible cell venting/degradation).
-  - Freezing floor: < -20°C (electrolyte freezing).
+  - Freezing floor: < -15°C (electrolyte freezing).
 - **Thermostat Parameters:**
   - Nominal battery heater setpoint: `battery_heater_setpoint = 15.0` °C.
   - Thermostat hysteresis: `heater_hysteresis_c = 2.0` °C (Turns ON at setpoint - hysteresis, OFF at setpoint).
   - Thermal safety upper cutoff: `thermal_cutoff_temp = 45.0` °C (Emergency override to prevent runaway).
 
 ## 4. Communications Subsystem (COMMS)
-- **Transceiver:** UHF/S-band direct-to-ground downlink.
+- **Transceiver:** UHF direct-to-ground downlink at 437.5 MHz (500 km LEO orbit).
   - Nominal RF output power: `tx_power_dbm = 30.0` dBm (1.0 Watt).
-  - High-gain patch antenna: `antenna_gain_dbi = 12.0` dBi.
-  - Slant-range atmospheric + space path loss: `path_loss_db = 35.0` dB (bench model baseline).
+  - High-gain patch antenna: `antenna_gain_dbi = 8.0` dBi.
+  - 500 km LEO slant-range Free Space Path Loss (FSPL): `path_loss_db = 141.5` dB.
+  - Ground Station Parameters: Receiver Gain `G_rx = 16.0` dBi, System Losses `L_sys = 2.5` dB, Demodulator Sensitivity `P_sens = -100.0` dBm.
   - Friis Link Margin Equation:
-    `Margin = (tx_power_dbm + antenna_gain_dbi + 26.0) - path_loss_db - 3.0 - (-110.0) - 100.0`
-  - Required operational link margin for telemetry packet lock: ≥ 3.0 dB.
+    `Margin (dB) = (tx_power_dbm + antenna_gain_dbi + 16.0) - path_loss_db - 2.5 - (-100.0)`
+  - Required operational link margin for telemetry packet lock: >= 3.0 dB.
   - Link budget scripts must dynamically query `path_loss_db` from `subsystems/comms.cfg`.
 """
 
@@ -109,8 +111,8 @@ sensor_poll_interval_s = 30
 _COMMS_CFG_NOMINAL = """\
 [comms]
 tx_power_dbm = 30.0
-antenna_gain_dbi = 12.0
-path_loss_db = 35.0
+antenna_gain_dbi = 8.0
+path_loss_db = 141.5
 frequency_mhz = 437.5
 baudrate_bps = 9600
 """
@@ -133,8 +135,9 @@ def calc_margin():
     gain = float(cfg['comms']['antenna_gain_dbi'])
     path_loss = float(cfg['comms']['path_loss_db'])
 
-    # Friis Link Equation: Margin (dB) = EIRP - Path_Loss + G_rx - Req_Sens - Imp_Loss
-    margin = (tx_power + gain + 26.0) - path_loss - 3.0 - (-110.0) - 100.0
+    # Friis Link Equation: Margin (dB) = P_tx + G_tx + G_rx - Path_Loss - L_sys - P_sens
+    # Ground Station: G_rx = 16.0 dBi, P_sens = -100.0 dBm, L_sys = 2.5 dB
+    margin = (tx_power + gain + 16.0) - path_loss - 2.5 - (-100.0)
     return round(margin, 2)
 
 
@@ -161,7 +164,7 @@ def calc_margin():
     gain = float(cfg['comms']['antenna_gain_dbi'])
     # BUG: hardcoded bench test value instead of querying config
     path_loss = 120.0
-    margin = (tx_power + gain + 26.0) - path_loss - 3.0 - (-110.0) - 100.0
+    margin = (tx_power + gain + 16.0) - path_loss - 2.5 - (-100.0)
     return round(margin, 2)
 
 
@@ -185,7 +188,6 @@ undervoltage_threshold = 2.80
 max_charge_rate_a = 1.2
 bus_voltage_nominal = 3.7
 """
-    # Telemetry log demonstrating the eclipse voltage collapse
     telemetry_csv = f"""\
 timestamp,orbit_phase,bus_voltage_v,battery_soc_pct,array_current_a
 2026-10-24T00:10:00Z,SUNLIGHT,3.68,{68.0 + noise_soc},0.48
@@ -347,7 +349,7 @@ def rf_downlink_closure_task(seed: int) -> TaskInstance:
 [comms]
 tx_power_dbm = 20.0
 antenna_gain_dbi = 2.0
-path_loss_db = 35.0
+path_loss_db = 141.5
 frequency_mhz = 437.5
 baudrate_bps = 9600
 """
@@ -450,7 +452,7 @@ sensor_poll_interval_s = 30
 [comms]
 tx_power_dbm = {tx_p}
 antenna_gain_dbi = 3.0
-path_loss_db = 35.0
+path_loss_db = 141.5
 frequency_mhz = 437.5
 baudrate_bps = 9600
 """

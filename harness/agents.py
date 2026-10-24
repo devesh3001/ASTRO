@@ -53,10 +53,21 @@ class OpenAIClient:
         pass
 
     def complete(self, messages, tools, timeout):
+        import time
         kwargs = dict(model=self.model, messages=messages, tools=tools, timeout=timeout)
         if self.max_tokens:
             kwargs["max_tokens"] = self.max_tokens      # optional: set MAX_TOKENS to cap each reply
-        response = self.client.chat.completions.create(**kwargs)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self.client.chat.completions.create(**kwargs)
+                break
+            except Exception as exc:
+                err_str = str(exc)
+                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower()) and attempt < max_retries - 1:
+                    time.sleep(14)
+                    continue
+                raise
         message = response.choices[0].message
         calls = []
         for index, call in enumerate(message.tool_calls or []):

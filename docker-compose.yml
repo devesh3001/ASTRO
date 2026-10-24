@@ -14,13 +14,16 @@ services:
     networks: [isolated]         # internal network only: no internet access
     init: true                   # forwards SIGTERM cleanly
     cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+    cap_add: [SETUID, SETGID, CHOWN, DAC_OVERRIDE]  # allows privilege separation and workspace management
+    security_opt: ["no-new-privileges:false"]
     pids_limit: 256
     mem_limit: 512m
     environment:
-      HARNESS_SECRET: ${HARNESS_SECRET:-aerosentinel_auth_token_secret_x82f1}
+      HARNESS_SECRET: ${HARNESS_SECRET:-}
       WORKSPACE_DIR: /workspace
       PORT: 8000
+    volumes:
+      - auth_tokens:/run/aerosentinel
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 2s
@@ -45,10 +48,14 @@ services:
       MODE: ${MODE:-full}
       APPEND_FILE: ${APPEND_FILE:-}
       SANDBOX_URL: http://sandbox:8000
-      HARNESS_SECRET: ${HARNESS_SECRET:-aerosentinel_auth_token_secret_x82f1}
+      HARNESS_SECRET: ${HARNESS_SECRET:-}
     volumes:
+      - auth_tokens:/run/aerosentinel:ro
       - ./logs:/app/logs
       - ./inputs:/app/inputs:ro
+
+volumes:
+  auth_tokens:                   # private in-memory communication volume for dynamic auth token
 
 networks:
   isolated:

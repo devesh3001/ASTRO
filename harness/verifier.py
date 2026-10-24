@@ -20,8 +20,9 @@ ORBIT_PERIOD_S = 5700.0         # ~95 minutes LEO orbit at 500 km
 SUNLIGHT_PERIOD_S = 3600.0      # ~60 minutes sunlight
 ECLIPSE_PERIOD_S = 2100.0       # ~35 minutes eclipse
 SOLAR_FLUX_W_M2 = 1361.0        # AM0 solar irradiance at 1 AU
-SOLAR_ARRAY_AREA_M2 = 0.025     # 3U deployable solar array area (~0.025 m2 effective)
-BATTERY_CAPACITY_WH = 30.0      # 3S2P Li-ion battery pack (30 Wh nominal)
+SOLAR_ARRAY_AREA_M2 = 0.06      # 3U deployable solar array area (0.06 m2 documented in flight manual)
+CELL_CONVERSION_EFF = 0.28      # Triple-junction GaAs cell nominal efficiency (28%)
+BATTERY_CAPACITY_WH = 40.0      # 3S2P Li-ion battery pack (40.0 Wh documented in flight manual)
 NOMINAL_BUS_V = 3.7             # 1S equivalent cell voltage nominal
 CRITICAL_UNDERVOLTAGE_V = 3.10  # Hardware cutoff voltage (below this = bus collapse)
 BASE_LOAD_POWER_W = 4.5         # OBC + ADCS + sensors baseline power draw
@@ -31,6 +32,11 @@ SIM_TIMESTEPS = 95              # 1 step = 60 seconds (full 95-minute orbit)
 DT_S = 60.0
 GROUND_PASS_START_S = 4200.0    # 8-minute ground station pass
 GROUND_PASS_DURATION_S = 480.0
+
+# RF Link Budget Physical Constants (UHF 437.5 MHz at 500 km LEO slant range)
+GROUND_STATION_RX_GAIN_DBI = 16.0   # UHF crossed-Yagi ground station array
+SYSTEM_LOSSES_DB = 2.5              # Atmospheric, polarization, and cable insertion losses
+GROUND_RX_SENSITIVITY_DBM = -100.0  # 9600 bps GFSK demodulator sensitivity threshold
 
 
 @dataclass
@@ -69,7 +75,7 @@ def simulate_orbit(
     tx_power_dbm: float,
     antenna_gain_dbi: float,
     path_loss_db: float,
-    initial_soc_pct: float = 60.0,
+    initial_soc_pct: float = 70.0,
     initial_temp_c: float = 14.0,
     initial_pointing_error_deg: float = 30.0,
     task_id: str = "",
@@ -118,9 +124,9 @@ def simulate_orbit(
         if in_eclipse:
             p_gen = 0.0
         else:
-            # P_gen = eta * Area * Flux * cos(pointing)
+            # P_gen = MPPT_factor * cell_eff * Area * Flux * cos(pointing)
             clamped_eff = max(0.0, min(0.85, solar_efficiency))
-            p_gen = clamped_eff * SOLAR_ARRAY_AREA_M2 * SOLAR_FLUX_W_M2 * cos_sun
+            p_gen = clamped_eff * CELL_CONVERSION_EFF * SOLAR_ARRAY_AREA_M2 * SOLAR_FLUX_W_M2 * cos_sun
 
         # ------------------------------------------------------------- C. TCS
         # Thermostat logic
@@ -175,7 +181,14 @@ def simulate_orbit(
         # ------------------------------------------------------------- D. COMMS
         # Directivity loss if pointing error is high during pass
         antenna_pointing_loss = min(20.0, (pointing_err / 10.0) ** 2)
-        link_margin = (tx_power_dbm + antenna_gain_dbi + 26.0) - path_loss_db - 3.0 - (-110.0) - 100.0 - antenna_pointing_loss
+        # Friis link margin: P_tx + G_tx + G_rx - L_path - L_sys - P_sens - Pointing_Loss
+        link_margin = (
+            (tx_power_dbm + antenna_gain_dbi + GROUND_STATION_RX_GAIN_DBI)
+            - path_loss_db
+            - SYSTEM_LOSSES_DB
+            - GROUND_RX_SENSITIVITY_DBM
+            - antenna_pointing_loss
+        )
         if in_ground_pass:
             min_link_margin = min(min_link_margin, link_margin)
             if link_margin >= 3.0 and bus_v >= undervoltage_threshold:
