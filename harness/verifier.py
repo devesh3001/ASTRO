@@ -79,6 +79,7 @@ class SimulationResult:
 
 PHYSICAL_BOUNDS = {
     "solar_efficiency": (0.0, 1.0),
+    "payload_duty_cycle": (0.0, 1.0),
     "undervoltage_threshold": (2.4, 4.2),
     "battery_capacity_wh": (30.0, 50.0),
     "wheel_bias_rpm": (-5000.0, 5000.0),
@@ -145,6 +146,8 @@ class AuthoritativeOrbitSimulator:
         self.heater_on: bool = False
         self.total_downlinked_kb: float = 0.0
         self.tx_energy_wh: float = 0.0
+        self.payload_energy_wh: float = 0.0
+        self.observation_s: float = 0.0
 
         # Trajectory extremes
         self.min_bus_v: float = 3.0 + 1.2 * (self.soc_wh / BATTERY_CAPACITY_WH)
@@ -166,6 +169,8 @@ class AuthoritativeOrbitSimulator:
         allowed = self.mission.get("allowed_baudrates_bps")
         if allowed and configs.get("baudrate_bps", 9600.0) not in allowed:
             return False, "Baud rate is not supported by the protected radio profile"
+        if configs.get("tx_power_dbm", 20) > self.mission.get("max_tx_power_dbm", float("inf")):
+            return False, "Transmitter power exceeds the protected mission ceiling"
         return valid, reason
 
     def advance(self, duration_s: float, configs: Dict[str, Any], dt_s: float = 60.0) -> List[TelemetryFrame]:
@@ -198,12 +203,14 @@ class AuthoritativeOrbitSimulator:
         pass_start = self.mission.get("ground_pass_start_s", GROUND_PASS_START_S)
         pass_end = pass_start + self.mission.get("ground_pass_duration_s", GROUND_PASS_DURATION_S)
         end_s = min(ORBIT_PERIOD_S, self.time_s + duration_s)
+        observation_start = self.mission.get("observation_start_s", 0)
+        observation_end = observation_start + self.mission.get("observation_duration_s", 0)
         new_frames = []
 
         while self.time_s < end_s - 1e-9:
             t = self.time_s
             # Split at physical events, so partial tool steps cannot create extra contact time.
-            boundaries = [b for b in (SUNLIGHT_PERIOD_S, pass_start, pass_end, end_s) if b > t + 1e-9]
+            boundaries = [b for b in (SUNLIGHT_PERIOD_S, pass_start, pass_end, observation_start, observation_end, end_s) if b > t + 1e-9]
             actual_dt = min(dt_s, min(boundaries) - t)
             in_eclipse = t >= SUNLIGHT_PERIOD_S
             in_ground_pass = pass_start <= t < pass_end
@@ -231,7 +238,12 @@ class AuthoritativeOrbitSimulator:
             elif self.temp_c >= heater_sp or self.temp_c >= thermal_cut:
                 self.heater_on = False
 
-            p_load = BASE_LOAD_POWER_W
+            duty = configs.get("payload_duty_cycle", 0.0)
+            payload_load = self.mission.get("payload_power_w", 0.0) * duty
+            self.payload_energy_wh += payload_load * actual_dt / 3600.0
+            if observation_start <= t < observation_end:
+                self.observation_s += duty * actual_dt
+            p_load = BASE_LOAD_POWER_W + payload_load
             if self.heater_on:
                 p_load += HEATER_POWER_W
             if in_ground_pass:
@@ -377,7 +389,14 @@ class AuthoritativeOrbitSimulator:
             "link_script_behavior": bool(script_verified),
             "rf_energy_allocation": energy_ok,
         }
-        total_reward = round(power_score + thermal_score + adcs_score + comms_score, 4)
+        observation_score = 0.0
+        if "required_observation_s" in self.mission:
+            checks["observation_target"] = self.observation_s + 1e-6 >= self.mission["required_observation_s"]
+            checks["payload_energy_allocation"] = self.payload_energy_wh <= self.mission["max_payload_energy_wh"] + 1e-9
+            power_score, thermal_score, adcs_score, comms_score = [s * .8 for s in (power_score, thermal_score, adcs_score, comms_score)]
+            if checks["payload_energy_allocation"]:
+                observation_score = .2 * clamp(self.observation_s / self.mission["required_observation_s"])
+        total_reward = round(power_score + thermal_score + adcs_score + comms_score + observation_score, 4)
         passed = total_reward >= 0.95 and all(checks.values())
 
         return SimulationResult(
@@ -387,6 +406,7 @@ class AuthoritativeOrbitSimulator:
                 "thermal_stability": round(thermal_score, 4),
                 "adcs_precision": round(adcs_score, 4),
                 "comms_closure": round(comms_score, 4),
+                **({"observation_completion": round(observation_score, 4)} if "required_observation_s" in self.mission else {}),
                 "total": total_reward,
             },
             frames=self.frames,

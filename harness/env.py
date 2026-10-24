@@ -77,7 +77,7 @@ class Env:
     def _request(self, method, path, payload=None):
         remaining = self._remaining()
         with requests.request(method, self.url + path, json=payload, headers=self._headers(),
-                              stream=True, timeout=(min(5, remaining), min(5, remaining))) as response:
+                              stream=True, timeout=(min(5, remaining), min(self.tool_timeout, remaining))) as response:
             response.raise_for_status()
             chunks, size = [], 0
             for chunk in response.iter_content(8192):
@@ -117,6 +117,7 @@ class Env:
 
         return {
             "solar_efficiency": safe_float(eps_cfg, "power", "solar_efficiency", 0.40),
+            "payload_duty_cycle": safe_float(eps_cfg, "power", "payload_duty_cycle", 0.0),
             "undervoltage_threshold": safe_float(eps_cfg, "power", "undervoltage_threshold", 2.80),
             "battery_capacity_wh": safe_float(eps_cfg, "power", "battery_capacity_wh", 40.0),
             "wheel_bias_rpm": safe_float(adcs_cfg, "attitude", "wheel_bias_rpm", 120.0),
@@ -170,6 +171,7 @@ class Env:
                 "battery_temp_c": self.sim.temp_c, "pointing_error_deg": error,
                 "heater_active": False,
                 "pass_active": False, "data_downlinked_kb": 0.0, "tx_energy_wh": 0.0,
+                "observation_s": 0.0, "payload_energy_wh": 0.0,
                 "link_margin_db": round(link_margin_db(configs, error), 1)}
 
 
@@ -190,6 +192,8 @@ class Env:
             "pass_active": last_frame.pass_active,
             "data_downlinked_kb": last_frame.data_downlinked_kb,
             "tx_energy_wh": round(self.sim.tx_energy_wh, 5),
+            "observation_s": round(self.sim.observation_s, 3),
+            "payload_energy_wh": round(self.sim.payload_energy_wh, 5),
         }
         csv_lines = "".join(
             f"{round(f.time_s/60.0, 1)},{'ECLIPSE' if f.eclipse else 'SUNLIGHT'},"
@@ -249,6 +253,7 @@ class Env:
                 if self.sim.catastrophic_failure:
                     output += f"\n[CRITICAL WARNING]: Irreversible safety violation triggered: {self.sim.failure_reason}"
                 return output, False
+            return "error: orbit cannot advance: " + (self.sim.failure_reason or "invalid simulation configuration"), True
 
         # Regular tools consume 30 seconds of virtual OBC execution time (capped at 95 min)
         result = self._post("/tool", {"name": name, "args": args}, self.tool_timeout)
@@ -274,6 +279,8 @@ class Env:
                 "pointing_err_deg": round(self.sim.pointing_err_deg, 3),
                 "downlinked_kb": round(self.sim.total_downlinked_kb, 3),
                 "tx_energy_wh": round(self.sim.tx_energy_wh, 6),
+                "observation_s": round(self.sim.observation_s, 6),
+                "payload_energy_wh": round(self.sim.payload_energy_wh, 6),
                 "catastrophic_failure": bool(self.sim.catastrophic_failure),
                 "failure_reason": str(self.sim.failure_reason),
                 "heater_on": bool(self.sim.heater_on),
@@ -361,14 +368,16 @@ class Env:
         progress = max(0.0, min(1.0, (raw["total"] - baseline_total) / max(0.0001, 1.0 - baseline_total)))
         if not sim_result.passed:
             progress = min(progress, 0.94)
-        keys = ("power_balance", "thermal_stability", "adcs_precision", "comms_closure")
-        gains = {key: max(0.0, raw[key] - (self.baseline[key] if self.baseline else 0.0)) for key in keys}
+        keys = sorted((set(raw) | set(self.baseline or {})) - {"total"})
+        gains = {key: max(0.0, raw.get(key, 0) - (self.baseline or {}).get(key, 0)) for key in keys}
         gain_sum = sum(gains.values())
         result = {key: round(progress * gains[key] / gain_sum, 6) if gain_sum else 0.0 for key in keys}
         result.update(total=round(progress, 6), raw_components=raw, baseline_total=baseline_total)
         self.last_verifier = {"passed": sim_result.passed and progress >= PASS_SCORE, "failure_reason": sim_result.failure_reason,
                               "checks": sim_result.checks,
                               "tx_energy_wh": round(sim_eval.tx_energy_wh, 5),
+                              "observation_s": round(sim_eval.observation_s, 3),
+                              "payload_energy_wh": round(sim_eval.payload_energy_wh, 5),
                               "projected": True, "final_soc_pct": round(sim_eval.soc_wh / BATTERY_CAPACITY_WH * 100, 3),
                               "final_pointing_deg": round(sim_eval.pointing_err_deg, 3),
                               "downlinked_kb": round(sim_eval.total_downlinked_kb, 3)}

@@ -36,6 +36,17 @@ class Reply:
     error: str | None = None
 
 
+class ProviderError(RuntimeError):
+    """Only a whitelisted exception class is exposed; provider bodies/headers stay private."""
+    TRANSIENT = {"RateLimitError", "InternalServerError", "APIConnectionError", "APITimeoutError"}
+    KNOWN = TRANSIENT | {"BadRequestError", "AuthenticationError", "PermissionDeniedError", "NotFoundError", "ValueError"}
+
+    def __init__(self, kind):
+        self.kind = kind if kind in self.KNOWN else "UnclassifiedProviderError"
+        self.recoverable = self.kind in self.TRANSIENT
+        super().__init__(f"model provider request failed ({self.kind}); credentials and response bodies withheld")
+
+
 # ------------------------------------------------------------ real models
 class OpenAIClient:
     """Calls any model through an OpenAI-compatible endpoint.
@@ -86,7 +97,7 @@ class OpenAIClient:
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError("model request exceeded its total deadline") from exc
         if result.returncode:
-            raise RuntimeError("model provider request failed; check endpoint, model and credentials")
+            raise ProviderError(result.stderr.strip())
         return self.normalize(result.stdout)
 
 
@@ -110,8 +121,7 @@ class MockClient:
         self.turn += 1
         calls = []
         if self.kind == "solver" and self.turn == 1:
-            for path, content in self.task.reference.items():
-                calls.append(("write_file", {"path": path, "content": content}))
+            calls.extend(oracle_actions(self.task))
             calls.append(("run_python", {"code": "print('verified')"}))
         else:
             calls.append(("finish", {}))
@@ -134,7 +144,7 @@ def make_client(model, api_key, base_url, max_tokens=None):
 # -------------------------------------------------------------- baselines
 def oracle_actions(task):
     """The reference solution as a list of (tool, args) actions. Must score full marks."""
-    return [("write_file", {"path": path, "content": content}) for path, content in task.reference.items()]
+    return list(task.reference_plan) if task.reference_plan else [("write_file", {"path": path, "content": content}) for path, content in task.reference.items()]
 
 
 def noop_actions(task):

@@ -7,10 +7,10 @@ Key improvements:
   bounds, equations, and diagnostic guidelines.
 - Dynamic seed variety: Seeds alter orbital initial conditions, telemetry noise,
   and fault profiles while maintaining guaranteed solvability for reference solutions.
-- Six tasks across three difficulty levels:
+- Eight tasks across three difficulty levels:
   * easy   : eps_eclipse_recovery, adcs_detumble_pointing
   * medium : thermal_battery_preservation, rf_downlink_closure, safe_mode_cascade
-  * hard   : rf_energy_tradeoff
+  * hard   : rf_energy_tradeoff, early_pass_recovery, observation_window_scheduling
 """
 import random
 import math
@@ -33,13 +33,14 @@ class TaskInstance:
     initial_temp_c: float = 14.0
     initial_pointing_error_deg: float = 35.0
     mission: dict = field(default_factory=dict)
+    reference_plan: list = field(default_factory=list)
 
 
 # ---- 2. CubeSat Flight Manual (docs/flight_manual.md) ------------------
 
 FLIGHT_MANUAL_MD = """\
 # AEROSENTINEL-3U CUBESAT FLIGHT SOFTWARE MANUAL
-**Document Ref:** AS3U-FSW-OPS-v3.0
+**Document Ref:** AS3U-FSW-OPS-v4.0
 **Orbit Specification:** 500 km Circular LEO, Period = 95 min (60 min sun, 35 min eclipse). Contact timing is mission-specific.
 
 ---
@@ -52,7 +53,7 @@ FLIGHT_MANUAL_MD = """\
 - **Battery Pack:** 3S2P Li-ion (Nominal voltage 3.7V equivalent, 40.0 Wh capacity).
   - Hardware critical collapse floor: 3.10 V.
   - Required software undervoltage cutoff: `undervoltage_threshold = 3.20` V. Setting this below 3.00 V risks unrecoverable bus collapse during peak eclipse load.
-  - Maximum safe charge current: `max_charge_rate_a = 1.2` A.
+  - `max_charge_rate_a` and `bus_voltage_nominal` are descriptive legacy fields, not simulated repair controls. Energy uses a fixed 40 Wh capacity and a linear SoC-to-voltage relation.
 
 ## 2. Attitude Determination & Control System (ADCS)
 - **Actuators:** 3-axis reaction wheel assembly + magnetic torquers.
@@ -86,11 +87,19 @@ FLIGHT_MANUAL_MD = """\
   - Delivered payload = `baudrate_bps/8 * 0.85 / 1000 * contact_seconds` kB at margin >= 3 dB; 50% delivery at 0-3 dB.
   - Transmitter bus load during contact = `8 + 2*10**(tx_power_dbm/10)/1000` W. RF energy is its time integral in Wh.
   - Hard missions publish a contact window, payload target, allowed baud rates and RF energy allocation in `docs/mission.json`. These take precedence over nominal bench settings; copying the nominal configuration is insufficient.
+  - Early-contact missions also publish a protected `max_tx_power_dbm`. Repairing after contact cannot recover data from a missed pass.
   - Every required outcome must pass. A missed payload or energy allocation cannot be offset by other subsystem scores.
 
 ---
 
-## 5. Multi-Subsystem Telemetry Diagnostics & Fault Signatures
+## 5. Observation Payload Scheduling
+On an observation mission, `payload_duty_cycle` in `subsystems/eps.cfg` is a software control between 0 and 1. The payload draws `payload_power_w * payload_duty_cycle` W continuously while enabled. It earns `payload_duty_cycle * elapsed_seconds` observation seconds only inside the protected observation window in `docs/mission.json`. Energy is charged outside the window too.
+
+Meet `required_observation_s` while keeping total payload energy below `max_payload_energy_wh`. Enable near the observation start and disable after the exposure, using `step_orbit` to schedule changes. Leaving it off misses the objective; leaving it on wastes energy. Mission time never rewinds. Every ordinary tool call advances 30 simulated seconds; `step_orbit` advances its requested 1-30 minutes.
+
+This is an evaluation model: scalar pointing, linear voltage, linear heat loss and averaged payload duty. The actuator torque/frequency and thermal polling fields are descriptive only. The model does not simulate a charger current regulator, rigid-body dynamics, orbital propagation or a radiation model.
+
+## 6. Multi-Subsystem Telemetry Diagnostics & Fault Signatures
 When diagnosing anomalies from `telemetry/live_telemetry.csv` and `telemetry/current_status.json`, cross-correlate telemetry columns before modifying configurations:
 
 1. **Low Bus Voltage / Rapid Eclipse Drain:**
@@ -572,6 +581,69 @@ def rf_energy_tradeoff_task(seed: int) -> TaskInstance:
     )
 
 
+
+def early_pass_recovery_task(seed: int) -> TaskInstance:
+    """A correct final configuration cannot undo a missed early contact."""
+    rng = random.Random(seed ^ 0xEA217)
+    start, duration = rng.choice([720, 780, 840]), rng.choice([120, 180])
+    loss, gain = round(rng.uniform(149.0, 150.5), 2), round(rng.uniform(7.0, 9.0), 2)
+    tx = math.ceil((3 + loss - gain - 113.5 + .2) * 10) / 10
+    comms = _COMMS_CFG_NOMINAL.replace('tx_power_dbm = 30.0', f'tx_power_dbm = {tx}')
+    fast = _ADCS_CFG_NOMINAL.replace('control_gain = 2.0', 'control_gain = 5.5')
+    slow = _ADCS_CFG_NOMINAL.replace('control_gain = 2.0', 'control_gain = 0.4')
+    return TaskInstance(
+        task_id='early_pass_recovery', title='Early Ground Contact Recovery', difficulty='hard',
+        instructions=('TIME-CRITICAL CONTACT [ADCS-PASS-219]: Pointing recovery is too slow for an early '
+            'station contact. Read the protected contact time, payload target and radio power ceiling in '
+            'docs/mission.json. Choose pointing control and radio settings that deliver the payload during '
+            'that pass. The nominal fine-pointing gain may converge only after the contact has gone. '
+            'A correct final pointing value does not recover missed data. Each ordinary tool call takes '
+            '30 simulated seconds, so plan inspections and repairs before advancing time.'),
+        files={'docs/flight_manual.md': FLIGHT_MANUAL_MD, 'subsystems/eps.cfg': _EPS_CFG_NOMINAL,
+            'subsystems/adcs.cfg': slow, 'subsystems/thermal.cfg': _THERMAL_CFG_NOMINAL,
+            'subsystems/comms.cfg': _COMMS_CFG_NOMINAL, 'scripts/link_budget.py': _LINK_BUDGET_SCRIPT_FIXED},
+        reference={'subsystems/adcs.cfg': fast, 'subsystems/comms.cfg': comms},
+        initial_soc_pct=75, initial_temp_c=12, initial_pointing_error_deg=45,
+        mission={'path_loss_db': loss, 'antenna_gain_dbi': gain, 'ground_pass_start_s': start,
+                 'ground_pass_duration_s': duration, 'required_downlink_kb': round(1.02 * duration * .95, 2),
+                 'max_tx_power_dbm': round(tx + .5, 1)},
+    )
+
+
+def observation_window_scheduling_task(seed: int) -> TaskInstance:
+    """Observation credit and power cost are integrated from the actual action history."""
+    rng = random.Random(seed ^ 0x0B5E2)
+    start, duration = rng.choice([1200, 1500, 1800]), rng.choice([600, 900])
+    off = _EPS_CFG_NOMINAL + 'payload_duty_cycle = 0.0\n'
+    on = _EPS_CFG_NOMINAL + 'payload_duty_cycle = 1.0\n'
+    task = TaskInstance(
+        task_id='observation_window_scheduling', title='Observation Window and Payload Energy', difficulty='hard',
+        instructions=('PAYLOAD SCHEDULING [SCI-WINDOW-308]: The observation payload is stuck on. '
+            'It consumes power continuously but earns useful exposure only during the observation window. '
+            'Use payload_duty_cycle in subsystems/eps.cfg and step_orbit to meet the exposure target and '
+            'payload energy allocation in docs/mission.json while preserving the other mission requirements. '
+            'A static configuration cannot meet both constraints. Account for the 30 seconds consumed '
+            'by each ordinary tool call. Inspect telemetry/current_status.json for accumulated exposure '
+            'and payload energy; changing the final file cannot rewrite that history.'),
+        files={'docs/flight_manual.md': FLIGHT_MANUAL_MD, 'subsystems/eps.cfg': on,
+            'subsystems/adcs.cfg': _ADCS_CFG_NOMINAL, 'subsystems/thermal.cfg': _THERMAL_CFG_NOMINAL,
+            'subsystems/comms.cfg': _COMMS_CFG_NOMINAL},
+        reference={'subsystems/eps.cfg': off},
+        initial_soc_pct=65, initial_temp_c=12, initial_pointing_error_deg=5,
+        mission={'observation_start_s': start, 'observation_duration_s': duration, 'payload_power_w': 6.0,
+                 'required_observation_s': duration * .9,
+                 'max_payload_energy_wh': round(6 * duration / 3600 * 1.2, 5), 'min_final_soc_pct': 60.0},
+    )
+    task.reference_plan = [
+        ('write_file', {'path': 'subsystems/eps.cfg', 'content': off}),
+        ('step_orbit', {'minutes': start // 60 - 1}),
+        ('write_file', {'path': 'subsystems/eps.cfg', 'content': on}),
+        ('step_orbit', {'minutes': duration // 60}),
+        ('write_file', {'path': 'subsystems/eps.cfg', 'content': off}),
+    ]
+    return task
+
+
 TASKS = {
     "eps_eclipse_recovery": eps_eclipse_recovery_task,
     "adcs_detumble_pointing": adcs_detumble_pointing_task,
@@ -579,6 +651,8 @@ TASKS = {
     "rf_downlink_closure": rf_downlink_closure_task,
     "safe_mode_cascade": safe_mode_cascade_task,
     "rf_energy_tradeoff": rf_energy_tradeoff_task,
+    "early_pass_recovery": early_pass_recovery_task,
+    "observation_window_scheduling": observation_window_scheduling_task,
 }
 
 DEMO_TASK = "eps_eclipse_recovery"

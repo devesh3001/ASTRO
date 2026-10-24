@@ -20,8 +20,10 @@ The default `MODEL=mock/solver` runs offline. Both baselines must pass before a 
 | `rf_downlink_closure` | Medium | Restore transmitter settings and repair the dynamic RF calculation |
 | `safe_mode_cascade` | Medium | Recover two seeded subsystem faults without an irreversible safety event |
 | `rf_energy_tradeoff` | Hard | Deliver a seeded payload within a short contact and RF energy allocation |
+| `early_pass_recovery` | Hard | Recover pointing and radio settings before an early contact is lost |
+| `observation_window_scheduling` | Hard | Schedule instrument exposure within a window and energy allocation |
 
-**Run A demo:** `eps_eclipse_recovery`.
+**Run A demo:** `eps_eclipse_recovery`, seed 0, with `APPEND_FILE=`. The sample is named `inputs/append.example.txt` so a fresh clone adds no extra prompt. For Run B, put the judge's file in `inputs/` and set its exact path.
 
 The flight manual provides nominal operational guidance. `docs/mission.json` reports instance-specific success targets and fixed hardware properties. Seeds change faults, energy requirements and hardware/link profiles. The hard mission also varies contact timing, duration, payload and radio energy allocation. Higher baud rates cost link margin; higher transmitter power costs energy. Nominal settings and maximum settings both fail its constraints. Agent edits cannot change protected mission metadata.
 
@@ -30,17 +32,17 @@ The flight manual provides nominal operational guidance. `docs/mission.json` rep
 Set these values in `.env` (or use shell environment overrides):
 
 - `MODE=full`: baselines then model for `TASK_ID`.
-- `MODE=baselines`: baselines for all six tasks.
+- `MODE=baselines`: baselines for all eight tasks.
 - `MODE=all`: all-task baselines then a model episode for each task.
 - `MODEL=mock/idle`: offline agent that immediately finishes, useful for failure-path checks.
 
-`APPEND_FILE` names a UTF-8 file inside `inputs/`. Its decoded text is appended without trimming or newline rewriting and recorded with its hash. An explicitly named missing, unreadable or blank file stops the run.
+`APPEND_FILE` names a UTF-8 file inside `inputs/`. Its decoded text is appended without trimming or newline rewriting and recorded with its hash. An explicitly named missing, unreadable or blank file stops the run. For compatibility, an existing `inputs/append.txt` is also loaded when the setting is empty. Keep that filename absent for Run A.
 
 ## State, actions and scoring
 
-State persists within an episode: elapsed orbital time, battery energy, temperature, scalar pointing error and downlinked data. Tools are `list_files`, `read_file`, `write_file`, `run_python`, `step_orbit` (1-30 minutes), and `finish`. Ordinary successful tool execution consumes 30 simulated seconds; the mission window is 95 simulated minutes. Initial telemetry is generated from the actual seeded simulator state. `read_file` accepts character `offset` and `limit` (up to 3500) and reports the next offset for long files, so the complete manual is accessible without custom code.
+State persists within an episode: elapsed orbital time, battery energy, temperature, scalar pointing error, downlinked data, payload energy and accumulated observation exposure. Tools are `list_files`, `read_file`, `write_file`, `run_python`, `step_orbit` (1-30 minutes), and `finish`. Ordinary successful tool execution consumes 30 simulated seconds; the mission window is 95 simulated minutes. Initial telemetry is generated from the actual seeded simulator state. `read_file` accepts character `offset` and `limit` (up to 3500) and reports the next offset for long files, so the complete manual is accessible without custom code.
 
-The raw score combines power (0.35), thermal behavior (0.25), pointing (0.20) and communications (0.20). Reported reward measures progress beyond the no-op world:
+The raw score combines power (0.35), thermal behavior (0.25), pointing (0.20) and communications (0.20). On observation missions these four weights are multiplied by 0.8, and exposure completion contributes the remaining 0.20. Every required check still has to pass. Reported reward measures progress beyond the no-op world:
 
 ```text
 reward = clamp((raw_score - initial_raw_score) / (1 - initial_raw_score), 0, 1)
@@ -59,7 +61,7 @@ The model is deliberately approximate: linear SoC/voltage, scalar attitude respo
 - The sandbox root filesystem is read-only. Workspace and temporary mounts have storage/inode bounds; workers have file, CPU, memory and output limits. The container enforces a 128-process/thread cgroup limit, avoiding UID-wide process limits that can break on shared CI hosts.
 - Protected file access rejects symlinks, hard links and special files. The sandbox network has no external route.
 - Execution ends at 40 model replies or 600 seconds, whichever comes first. Each reply allows 10 tools; each complete tool operation has a 60-second deadline. Final verification has a separate 120-second budget. Baselines share 120 seconds per task.
-- Provider calls run in a cancellable process without hidden SDK retries. Received malformed replies count once and get corrective feedback. Context trimming conservatively bounds request size while retaining valid tool/result groups.
+- Provider calls run in a cancellable process without hidden SDK retries. At most two explicit, logged retries per episode handle transient connection, timeout, rate-limit or server failures within the same 600-second budget; authentication and malformed requests stop immediately. Failed requests that receive no reply do not consume an agent step. Received malformed replies count once and get corrective feedback. Context trimming conservatively bounds request size while retaining valid tool/result groups.
 
 Docker and the host kernel remain part of the trust boundary. This is not a VM-level security guarantee. A failed task is an expected outcome when the verifier scores it honestly.
 
@@ -69,10 +71,10 @@ With Python dependencies installed, run:
 
 ```sh
 python tests/test_physics.py
-python -m unittest tests.test_adversarial tests.test_hardening tests.test_packaging tests.test_mission_planning tests.test_seeds_extended
+python -m unittest tests.test_adversarial tests.test_hardening tests.test_packaging tests.test_mission_planning tests.test_temporal_missions tests.test_failure_feedback tests.test_seeds_extended
 ```
 
-The seed suite checks actual reset hashes and both baselines across 120 task/seed combinations (six tasks, seeds 0-19). Planning regressions additionally check 100 separate seeds (100-199) against nominal and maximum-radio shortcuts, exact contact capacity, alternative plans, and protected requirements. For Linux UID/network/resource tests:
+The seed suite checks actual reset hashes and both baselines across 160 task/seed combinations (eight tasks, seeds 0-19). Planning regressions additionally check 100 separate seeds (100-199) against nominal and maximum-radio shortcuts, exact contact capacity, alternative plans, and protected requirements. For Linux UID/network/resource tests:
 
 ```sh
 docker compose up -d sandbox
@@ -96,16 +98,22 @@ The report is written to `logs/benchmarks/policy-ablation.json`. It labels the r
 
 CI runs integration regressions, this policy comparison, all-task gates, an offline solver run and live sandbox checks, and uploads sanitized logs. Offline solver results validate plumbing; they are not real-model capability evidence.
 
+## Present and defend the project
+
+Read [the presentation guide](docs/presentation-defense.md) for the ten-minute talk, demo procedure, likely questions and explicit limitations. [Model assumptions](docs/model-assumptions.md) explains the equations and controls. [The PS checklist](docs/ps-checklist.md) separates tested requirements from administrative items.
+
+The first five tasks are guided recovery exercises. The three hard tasks test radio planning, an irreversible contact deadline, and observation scheduling. This is an environment for evaluating agents; no policy is trained here. The reference policy is privileged validation code, never a model-performance claim.
+
 ## Logs and submission
 
 Each run writes `gate.json`, JSONL records, a unique run identifier and a source fingerprint manifest under `logs/`. Model runs also write a summary and episode termination, verifier reasons and diagnostics. Credentials are never part of the manifest.
 
-The registered team name is **Astro**. Generate the two-page design document, ten-slide deck and one archive with:
+The registered team name is **Astro**. The reviewed two-page design document and ten-slide deck are tracked in `submission_bundle/`. Validate those PDFs and build the reference archive with:
 
 ```sh
 python scripts/build_submission_docs.py --team-name Astro
 ```
 
-Document generation requires `reportlab==4.4.9`. Use `--docs-only` to regenerate PDFs without an archive. Packaging requires current-code all-task gates, at least three genuine model runs, and success/failure trajectories. It validates episode records, matching source fingerprints, summaries and credential scans. It refuses to relabel historical logs or manufacture missing evidence. A failure sample may be an executed scripted adversarial regression, explicitly identified in failure-provenance.json; such a sample never counts as one of the three genuine model runs.
+Use `--docs-only` to validate the reviewed PDFs without building an archive. Packaging preserves those documents; it does not regenerate them from an older template. Packaging requires current-code all-task gates, at least three genuine model runs, and success/failure trajectories. It validates episode records, matching source fingerprints, summaries and credential scans. It refuses to relabel historical logs or manufacture missing evidence. Zero-reply provider failures are preserved separately as diagnostic attempts and never count toward the three complete runs. A failure sample may be an executed scripted adversarial regression, explicitly identified in failure-provenance.json; such a sample never counts as one of the three genuine model runs.
 
 The output is `Astro.zip`, containing `baseline-results/`, `test-run-logs/`, `sample-trajectories/`, `design-doc.pdf`, `deck.pdf` and a checksum manifest. Existing historical runs may be kept locally but do not certify changed code. Confirm the repository name, private visibility and organiser access against the submission instructions before uploading.

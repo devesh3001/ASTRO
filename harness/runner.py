@@ -119,6 +119,7 @@ def run_scripted(env, task_id, seed, actions, agent, log):
 def run_episode(env, task_id, seed, client, append_text, limits, log):
     started, deadline, termination, steps = None, None, None, 0
     final, fatal = {"total": None}, None
+    provider_retries = 0
     messages = []
     try:
         prompt = env.reset(task_id, seed)
@@ -140,9 +141,17 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
             try:
                 reply = client.complete(sent, TOOLS, timeout=min(60.0, deadline - call_start))
             except Exception as exc:
+                recoverable = getattr(exc, "recoverable", False) or isinstance(exc, TimeoutError)
+                retry = recoverable and provider_retries < 2 and time.monotonic() < deadline
                 log.write({"timestamp": now(), "agent": "model", "task": task_id,
                            "event": "model_call_failed", "seed": seed, "steps": steps,
-                           "error": f"{type(exc).__name__}: {exc}"})
+                           "error": f"{type(exc).__name__}: {exc}", "retry": retry,
+                           "retry_number": provider_retries + 1 if retry else None})
+                if retry:
+                    provider_retries += 1
+                    time.sleep(min(.5, max(0, deadline - time.monotonic())))
+                    continue  # no reply was received, so no agent step is consumed
+                fatal = f"{type(exc).__name__}: {exc}"
                 termination = "time_cap" if time.monotonic() >= deadline else "crash"
                 break
             steps += 1  # exactly one step per received reply, including malformed replies
@@ -219,4 +228,4 @@ def run_episode(env, task_id, seed, client, append_text, limits, log):
                   "seed": seed, "steps": steps, "termination": termination, "reward": final,
                   "elapsed_s": elapsed, "error": fatal, "verifier": dict(getattr(env, "last_verifier", {}))}
         log.write(ending)
-    return {key: ending[key] for key in ("termination", "steps", "reward", "elapsed_s", "verifier")}
+    return {key: ending[key] for key in ("termination", "steps", "reward", "elapsed_s", "verifier", "error")}
