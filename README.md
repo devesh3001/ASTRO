@@ -72,7 +72,7 @@ With Python dependencies installed, run:
 
 ```sh
 python tests/test_physics.py
-python -m unittest tests.test_adversarial tests.test_hardening tests.test_packaging tests.test_mission_planning tests.test_temporal_missions tests.test_failure_feedback tests.test_provider_contract tests.test_consistency tests.test_science_mission tests.test_seeds_extended
+python -m unittest tests.test_adversarial tests.test_hardening tests.test_packaging tests.test_mission_planning tests.test_temporal_missions tests.test_failure_feedback tests.test_provider_contract tests.test_consistency tests.test_science_mission tests.test_seeds_extended tests.test_judge_contract tests.test_mission_stress tests.test_supplemental_evidence
 ```
 
 The seed suite checks actual reset hashes and both baselines for every registered task on seeds 0-19. Planning and science regressions additionally use separate seeds to check static-duty impossibility, nominal and maximum-radio shortcuts, buffer conservation, irreversible loss, per-window quotas, alternative schedules and protected requirements. Consistency regressions check identical physical histories across allowed tool-time groupings, strict mandatory configuration parsing and full live-schema script evaluation. Script checks use the current communications configuration plus perturbed full-schema cases; results are cached by script, communications configuration and seed, and configuration changes trigger re-evaluation. The provider contract suite sends actual HTTP requests only to local synthetic endpoints. It tests reply normalization, error classification and bounded response handling; it is not evidence of real model capability or cross-provider success. For Linux UID/network/resource tests:
@@ -97,11 +97,22 @@ python scripts/benchmark_policies.py
 
 The report is written to `logs/benchmarks/policy-ablation.json`. It labels the reference policy as privileged and never calls a model API. It measures shortcut resistance, not language-model ability.
 
+Run the supplemental Run B checks without a provider key:
+
+```sh
+python scripts/check_runb_contract.py
+python scripts/stress_missions.py
+```
+
+The first runs the actual SDK subprocess and episode runner against local synthetic HTTP fixtures. It checks exact Unicode/CRLF append text, opaque deployment names, malformed-reply recovery, signed metadata, retries and cancellation. It does not test the judge's undisclosed model or instruction obedience. The second uses independent plans derived only from public mission inputs across held-out generated seeds and corner profiles. It tests near-boundary energy/exposure choices, irreversible loss and alternative controllers through the simulator and a private local HTTP environment. It does not add task families or certify production isolation. Both reports explicitly record zero real-model calls and zero external-provider requests.
+
+Reports are written to `logs/benchmarks/runb-contract.json` and `mission-stress.json`. Their runtime/build hashes, validation-code hashes, HTTP-fixture hash and actual case counts must match before packaging. Correctly rejected bad decisions are passing stress expectations, not successful mission episodes.
+
 CI runs integration regressions, this policy comparison, all-task gates, an offline solver run and live sandbox checks, and uploads sanitized logs. Offline solver results validate plumbing; they are not real-model capability evidence.
 
 ## Present and defend the project
 
-Read [the presentation guide](docs/presentation-defense.md) for the ten-minute talk, demo procedure, likely questions and explicit limitations. [Model assumptions](docs/model-assumptions.md) explains the equations and controls. [The PS checklist](docs/ps-checklist.md) separates tested requirements from administrative items.
+Use [the timed rehearsal and answer key](docs/rehearsal-pack.md) to practice the talk and six-minute Q&A; it includes a human-filled mastery rubric. Use [the submission handoff](docs/submission-handoff.md) to record organizer access and the actual submission receipt. Read [the presentation guide](docs/presentation-defense.md) for the ten-minute talk, demo procedure, likely questions and explicit limitations. [Model assumptions](docs/model-assumptions.md) explains the equations and controls. [The PS checklist](docs/ps-checklist.md) separates tested requirements from administrative items.
 
 The first five tasks are guided recovery exercises. The four hard tasks test radio planning, an irreversible contact deadline, observation scheduling, and coupled acquisition/storage/downlink planning. In the science mission, the first contact must free buffer space before the second acquisition; contacts cannot deliver data that has not been acquired. Generated science always equals buffered plus delivered plus dropped science. Every window quota, both energy allocations and the no-loss requirement must pass. A constant payload duty cannot meet both the exposure and full-episode energy constraints; see the proof in the model assumptions. This is an environment for evaluating agents; no policy is trained here. The reference policy is privileged validation code, never a model-performance claim.
 
@@ -117,4 +128,4 @@ python scripts/build_submission_docs.py --team-name Astro
 
 Use `--docs-only` to validate the reviewed PDFs without building an archive. Packaging preserves those documents; it does not regenerate them from an older template. Packaging requires current-code all-task gates, at least three genuine model runs, and success/failure trajectories. It validates episode records, matching source and runtime-contract fingerprints, summaries and credential scans. Version 2 manifests and incomplete runtime-contract hashes cannot certify the current source. Reviewed validation summaries and referenced defense probes must also match contract v3. It refuses to relabel historical logs or manufacture missing evidence. Zero-reply provider failures are preserved separately as diagnostic attempts and never count toward the three complete runs. A failure sample may be an executed scripted adversarial regression, explicitly identified in failure-provenance.json; such a sample never counts as one of the three genuine model runs.
 
-The output is `Astro.zip`, containing `baseline-results/`, `test-run-logs/`, `sample-trajectories/`, `design-doc.pdf`, `deck.pdf` and a checksum manifest. Existing historical runs may be kept locally but do not certify changed code. Read current run IDs and measured results from the final validation record; earlier eight-task results do not establish nine-task or updated-provider performance. The repository remains public at the user's explicit request, which does not meet the PS private-repository requirement. Registered `Astro` versus repository `astro`, organizer access, eligibility, deadline and form submission remain administrative checks to resolve before claiming full compliance.
+The output is `Astro.zip`, containing `baseline-results/`, `test-run-logs/`, `sample-trajectories/`, `design-doc.pdf`, `deck.pdf` and a checksum manifest. Current supplemental reports are included under `baseline-results/`, with rehearsal/handoff notes under `presentation-support/`. Existing historical runs may be kept locally but do not certify changed code. Read current run IDs and measured results from the final validation record; earlier eight-task results do not establish nine-task or updated-provider performance. The repository remains public at the user's explicit request, which does not meet the PS private-repository requirement. Registered `Astro` versus repository `astro`, organizer access, eligibility, deadline and form submission remain administrative checks to resolve before claiming full compliance.

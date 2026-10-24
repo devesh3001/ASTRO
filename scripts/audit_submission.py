@@ -12,7 +12,8 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from harness.tasks import TASKS, DEMO_TASK
-from package_submission import collect_evidence, fingerprints, contract_fingerprint, provenance_matches
+from package_submission import (collect_evidence, fingerprints, contract_fingerprint, provenance_matches,
+                                validate_supplemental_report, SUPPLEMENTAL_REPORTS)
 from harness.provenance import CONTRACT_VERSION
 
 
@@ -77,6 +78,21 @@ def main():
             assert all(n in names for n in ['baseline-results/gate.json', 'sample-trajectories/success.jsonl',
                 'sample-trajectories/failure.jsonl', 'design-doc.pdf', 'deck.pdf'])
             add('Archive layout, evidence and credential scan', 'pass', f'{archive.name}: {len(names)} files, current fingerprints and verified checksums')
+            reviewed_path = ROOT/'submission_bundle/validation-evidence.json'
+            if reviewed_path.is_file():
+                reviewed = json.loads(reviewed_path.read_text(encoding='utf-8'))
+                assert json.loads(bundle.read('baseline-results/validation-evidence.json')) == reviewed
+                supplemental = reviewed.get('supplemental_validation', {})
+                for report_name in SUPPLEMENTAL_REPORTS:
+                    if report_name in supplemental:
+                        current = validate_supplemental_report(ROOT/'logs/benchmarks'/report_name)
+                        assert supplemental[report_name] == current
+                        assert json.loads(bundle.read('baseline-results/'+report_name)) == current
+                if supplemental:
+                    add('Source-bound supplemental Run B evidence', 'pass',
+                        {'reports': sorted(supplemental), 'model_calls': 0,
+                         'scope': 'Synthetic interface and independent scripted mission checks; not undisclosed-model performance'})
+
             try:
                 import io
                 from pypdf import PdfReader

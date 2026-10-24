@@ -20,9 +20,13 @@ jobs:
       - name: Baseline integration and regression tests
         run: |
           python tests/test_physics.py
-          python -m unittest tests.test_adversarial tests.test_hardening tests.test_packaging tests.test_mission_planning tests.test_temporal_missions tests.test_failure_feedback tests.test_provider_contract tests.test_consistency tests.test_science_mission tests.test_seeds_extended
+          python -m unittest tests.test_adversarial tests.test_hardening tests.test_packaging tests.test_mission_planning tests.test_temporal_missions tests.test_failure_feedback tests.test_provider_contract tests.test_consistency tests.test_science_mission tests.test_seeds_extended tests.test_judge_contract tests.test_mission_stress tests.test_supplemental_evidence
       - name: Compare scripted planning policies on separate seeds
         run: python scripts/benchmark_policies.py --tasks rf_energy_tradeoff early_pass_recovery observation_window_scheduling science_store_forward --seeds 100 101 102
+      - name: Exercise synthetic judge interface and held-out mission plans
+        run: |
+          python scripts/check_runb_contract.py
+          python scripts/stress_missions.py
       - name: Measure isolated cold build
         run: python scripts/check_cold_build.py
       - name: Run all-task gates and offline solver

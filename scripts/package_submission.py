@@ -94,6 +94,62 @@ def collect_evidence(logs):
     return gates[0], runs, successes[0], failures[0]
 
 
+SUPPLEMENTAL_REPORTS = {
+    "runb-contract.json": ("scripts/check_runb_contract.py", "tests/test_judge_contract.py"),
+    "mission-stress.json": ("scripts/stress_missions.py", "tests/test_mission_stress.py"),
+}
+
+
+def validate_supplemental_report(path):
+    """Accept successful offline reports only for their exact validation sources."""
+    if path.name not in SUPPLEMENTAL_REPORTS:
+        raise ValueError("Unknown supplemental validation report")
+    record = json_file(path)
+    if not provenance_matches(record):
+        raise ValueError("Supplemental validation belongs to older runtime source/build inputs")
+    if record.get("passed") is not True or record.get("model_called") is not False:
+        raise ValueError("Supplemental validation must pass and be explicitly offline")
+    role = {"runb-contract.json": "synthetic_provider_conformance",
+            "mission-stress.json": "offline_mission_stress"}[path.name]
+    if (record.get("evidence_role") != role
+            or any(type(record.get(key)) is not int or record[key] != 0
+                   for key in ("real_model_calls", "external_provider_requests"))):
+        raise ValueError("Supplemental validation role or request counters are inconsistent")
+    if path.name == "runb-contract.json":
+        if (type(record.get("tests")) is not int or record["tests"] < 1
+                or any(type(record.get(key)) is not int or record[key] != 0
+                       for key in ("failures", "errors", "skipped"))
+                or type(record.get("loopback_requests")) is not int or record["loopback_requests"] < 1):
+            raise ValueError("Synthetic conformance test counts do not establish a passing run")
+    if path.name == "mission-stress.json":
+        rows = record.get("results", [])
+        count = record.get("episodes")
+        if (record.get("complete") is not True or record.get("stopped_reason") is not None
+                or type(count) is not int or count < 1 or not isinstance(rows, list)
+                or any(type(record.get(key)) is not int for key in ("http_cases", "simulator_cases", "expectations_met"))
+                or len(rows) != count or record.get("expectations_met") != count
+                or record.get("failures") != []
+                or any(not isinstance(row, dict) or row.get("expectation_met") is not True
+                       or type(row.get("passed")) is not bool or type(row.get("expected_success")) is not bool
+                       or row["passed"] != row.get("expected_success") for row in rows)
+                or record.get("http_cases", 0) < 1
+                or record.get("http_cases") != sum(row.get("transport") == "http" for row in rows)
+                or record.get("simulator_cases") != sum(row.get("transport") == "simulator" for row in rows)
+                or record.get("http_cases") + record.get("simulator_cases") != count):
+            raise ValueError("Mission stress case counts do not establish a complete passing run")
+        support_hash = hashlib.sha256((ROOT / "tests/support.py").read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+        if record.get("support_fixture_sha256") != support_hash:
+            raise ValueError("Mission stress HTTP fixture source changed")
+    sources = record.get("validation_sources", {})
+    if not isinstance(sources, dict) or set(sources) != set(SUPPLEMENTAL_REPORTS[path.name]):
+        raise ValueError("Supplemental validation source allowlist mismatch")
+    for name, expected in sources.items():
+        actual = hashlib.sha256((ROOT / name).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+        if actual != expected:
+            raise ValueError("Supplemental validation source changed: " + name)
+    return record
+
+
 def validate_documents(team):
     """Package the reviewed tracked PDFs without overwriting them with stale templates."""
     if team != 'Astro':
@@ -156,6 +212,20 @@ def assemble(team, logs, output):
                 raise ValueError("Executed defense-probe evidence belongs to an older runtime contract")
             for name in ("manifest.json", "episode.jsonl", "summary.json"):
                 include(directory/name, f"sample-trajectories/defense-probes/{directory.name}/"+name)
+    supplemental = record.get("supplemental_validation", {}) if reviewed_evidence.is_file() else {}
+    if not isinstance(supplemental, dict) or set(supplemental) - set(SUPPLEMENTAL_REPORTS):
+        raise ValueError("Unknown supplemental evidence in reviewed summary")
+    for name in SUPPLEMENTAL_REPORTS:
+        path = logs / "benchmarks" / name
+        if path.exists() or name in supplemental:
+            report = validate_supplemental_report(path)
+            if supplemental.get(name) != report:
+                raise ValueError("Supplemental report does not match the reviewed summary: " + name)
+            include(path, "baseline-results/" + name)
+    for name in ("rehearsal-pack.md", "submission-handoff.md"):
+        path = ROOT / "docs" / name
+        if path.is_file():
+            include(path, "presentation-support/" + name)
     include(success, "sample-trajectories/success.jsonl")
     include(failure, "sample-trajectories/failure.jsonl")
     include(failure.parent / "manifest.json", "sample-trajectories/failure-provenance.json")

@@ -44,7 +44,7 @@ Run the complete local regression command, build and current-source evidence wor
 
 ```sh
 python tests/test_physics.py
-python -m unittest tests.test_adversarial tests.test_hardening tests.test_packaging tests.test_mission_planning tests.test_temporal_missions tests.test_failure_feedback tests.test_provider_contract tests.test_consistency tests.test_science_mission tests.test_seeds_extended
+python -m unittest tests.test_adversarial tests.test_hardening tests.test_packaging tests.test_mission_planning tests.test_temporal_missions tests.test_failure_feedback tests.test_provider_contract tests.test_consistency tests.test_science_mission tests.test_seeds_extended tests.test_judge_contract tests.test_mission_stress tests.test_supplemental_evidence
 ```
 
 After genuine evidence and reviewed documents are ready, run the read-only audit:
@@ -54,3 +54,10 @@ python scripts/audit_submission.py --team-name Astro --github
 ```
 
 Use the final suite's actual counts rather than a hardcoded earlier total. Synthetic endpoint checks validate local behavior; privileged reference plans validate feasibility. Neither supplies one of the three genuine model runs. The audit deliberately reports `NOT_COMPLETE` while technical evidence or administrative requirements remain open. Public visibility is not treated as satisfying the private-repository instruction; the user's explicit preference controls visibility.
+
+
+## Supplemental final checks
+
+Run `python scripts/check_runb_contract.py` and `python scripts/stress_missions.py` to regenerate source-bound offline reports. They strengthen measured interface and mission coverage without evaluating the undisclosed judge model or actual unknown append. Packaging rejects inconsistent labels/counts, changed validation code or HTTP fixtures, and reports that differ from the reviewed summary.
+
+Practice with `docs/rehearsal-pack.md`; complete its human entries after an actual rehearsal. Follow `docs/submission-handoff.md` to record organizer access, accepted spelling/visibility and submission confirmation. Prepared materials do not establish that those human actions have occurred.
