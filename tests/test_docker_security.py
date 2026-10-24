@@ -88,7 +88,7 @@ finally:
 """
         result = self._post_tool("run_python", {"code": code})
         self.assertFalse(result["is_error"], result)
-        observed = json.loads(result["output"].strip())
+        observed = json.loads(result["output"].splitlines()[0])
         self.assertEqual(observed["limit"], 128)
         self.assertGreaterEqual(observed["children"], 40, observed)
         self.assertLess(observed["children"], 128, observed)
