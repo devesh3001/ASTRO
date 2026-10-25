@@ -6,18 +6,18 @@ This is a practice exercise and answer key, not evidence that the team has rehea
 
 Assign one speaker, one timer and one questioner. Begin the talk while the Run A demonstration starts, as allowed by the PS. Use recorded evidence when practicing; this exercise does not require another paid model run. Hide `.env` and any window containing credentials.
 
-| Slide and actual title | Stopwatch | Required explanation and practice check |
+| Slide and actual title | Stopwatch | What to explain |
 |---|---:|---|
-| 1. AeroSentinel | 0:00-0:35 | State the project purpose in one sentence: an evaluation environment where agents repair and schedule a simplified satellite mission. Judges supply the agent; no policy is trained here. |
-| 2. Each action changes a persistent mission | 0:35-1:25 | Name one observation, one action and one protected outcome. Explain 30-second ordinary tool costs, 40 replies, 10 tools per reply and the real-time budget. |
-| 3. Nine tasks, four planning challenges | 1:25-2:15 | Identify five guided repairs and four hard missions. Give one different constraint for RF tradeoff, early contact, observation and science storage. |
-| 4. Two science windows, one finite buffer | 2:15-3:30 | Trace science seed 101 using the worksheet below. Explain why the first contact matters and why constant duty cannot satisfy the energy/exposure constraints. |
-| 5. Reward follows verified mission history | 3:30-4:30 | Write the normalization equation. Explain why observation reward 0.8 is still failure, and why one window cannot compensate for another. |
-| 6. Separate processes protect scoring and mission facts | 4:30-5:30 | Distinguish harness, UID 1001 agent and UID 1002 evaluator. Name one live-tested boundary and the remaining Docker/kernel trust. |
-| 7. Six executed probes fail the success checks | 5:30-6:30 | Choose a forged-inventory or missed-contact probe. Explain the attempted shortcut, the protected check and the measured failure. Label it scripted. |
-| 8. Reproducibility and shortcut comparison | 6:30-7:35 | Distinguish 150 Linux regressions, 180 task/seed pairs and 12 live isolation checks. Explain the separate 474-case mission stress report (80 feasible plans, 394 correctly rejected decisions) and 13 synthetic interface tests over 32 local HTTP requests; the 13 tests are included in the 150 total, not additional model runs. Explain v3 expected-build provenance without claiming active-daemon attestation. |
-| 9. Four organizer-model validation attempts | 7:35-8:45 | Report all four outcomes, including the observation failure. Explain that local fake-endpoint tests are synthetic conformance checks, not additional real-provider successes. |
-| 10. Demo and presentation defense | 8:45-10:00 | Show Run A's final checks, summarize the scientific limitations and state unresolved submission requirements. Finish within ten minutes. |
+| 1. AeroSentinel | 0:00-0:35 | Introduce an evaluation environment for satellite recovery and planning. Judges supply the agent; no policy is trained. |
+| 2. The problem: a repair can arrive too late | 0:35-1:20 | Explain why time, energy and storage make the order of decisions matter. |
+| 3. How an episode works | 1:20-2:15 | Explain observation, tools and protected evaluation. Distinguish simulated mission time from the execution budget. |
+| 4. Nine tasks, with increasing planning depth | 2:15-3:05 | Identify the five guided repairs and four harder planning missions, with seeded faults and three difficulty levels. |
+| 5. The planning test: collect, transmit, repeat | 3:05-4:20 | Trace science seed 101 through two acquisitions and contacts. Explain the finite buffer and constant-duty contradiction. |
+| 6. What earns a successful score | 4:20-5:20 | Explain clamped no-op normalization and mandatory checks. Healthy subsystems cannot compensate for a missed quota. |
+| 7. The agent cannot award itself success | 5:20-6:20 | Explain independent verification and six scripted failure probes. State the remaining Docker/kernel trust. |
+| 8. Validation on the final source | 6:20-7:25 | Distinguish 150 regressions, 12 real-container isolation checks, nine gates and 474 stress expectations: 80 feasible plans and 394 correctly rejected choices. |
+| 9. What the organizer model actually achieved | 7:25-8:40 | Report four genuine gpt-6-luna runs, three successes and one observation planning failure. Do not generalize a success rate from four attempts. |
+| 10. Demo: EPS eclipse recovery | 8:40-10:00 | Show Run A final mission checks, or clearly label the saved trajectory if using it. State scientific and validation limits. Finish within ten minutes. |
 
 Practice log, to be completed by a human after an actual rehearsal:
 

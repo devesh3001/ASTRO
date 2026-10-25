@@ -4,18 +4,18 @@ Use `submission_bundle/deck.pdf` for the required PDF presentation. Use the edit
 
 ## Talk sequence
 
-| Slide | Time | What to explain |
+| Slide and actual title | Stopwatch | What to explain |
 |---|---:|---|
-| 1. AeroSentinel | 0:00-0:35 | We evaluate recovery and planning decisions against protected mission history. Judges supply the model. |
-| 2. Environment contract | 0:35-1:25 | State, observations, actions, time costs and independent outcome checks. Explain the fixed event-split integration grid. |
-| 3. Task progression | 1:25-2:15 | Nine families: five guided repairs and four hard missions. Distinguish each planning constraint. |
-| 4. Coupled science planning | 2:15-3:30 | Two acquisitions generate data into finite storage; the first contact frees space before the next acquisition. Show the static-duty contradiction and conservation equation. |
-| 5. Reward and protected history | 3:30-4:30 | Component weights, no-op normalization and mandatory checks. One window cannot compensate for another; final files cannot restore lost data. |
-| 6. Isolation and verification | 4:30-5:30 | Harness, agent and isolated evaluator; live-schema script checks, credential protection, cleanup and remaining kernel trust. |
-| 7. Failure and consistency probes | 5:30-6:30 | Show executed forged-telemetry or missed-window evidence. Explain malformed-configuration rejection and grouping-invariant physical history. |
-| 8. Reproducibility evidence | 6:30-7:35 | Current seed sweep, cold build and live checks. Explain v3 expected-build provenance and its limits. |
-| 9. Model and interface results | 7:35-8:45 | Report actual final-source model outcomes and transport failures. Label local fake-endpoint checks as synthetic conformance tests. |
-| 10. Demo and limitations | 8:45-10:00 | Show demo logs and named checks. State simplified dynamics, finite adversarial coverage and unresolved administrative requirements. |
+| 1. AeroSentinel | 0:00-0:35 | Introduce an evaluation environment for satellite recovery and planning. Judges supply the agent; no policy is trained. |
+| 2. The problem: a repair can arrive too late | 0:35-1:20 | Explain why time, energy and storage make the order of decisions matter. |
+| 3. How an episode works | 1:20-2:15 | Explain observation, tools and protected evaluation. Distinguish simulated mission time from the execution budget. |
+| 4. Nine tasks, with increasing planning depth | 2:15-3:05 | Identify the five guided repairs and four harder planning missions, with seeded faults and three difficulty levels. |
+| 5. The planning test: collect, transmit, repeat | 3:05-4:20 | Trace science seed 101 through two acquisitions and contacts. Explain the finite buffer and constant-duty contradiction. |
+| 6. What earns a successful score | 4:20-5:20 | Explain clamped no-op normalization and mandatory checks. Healthy subsystems cannot compensate for a missed quota. |
+| 7. The agent cannot award itself success | 5:20-6:20 | Explain independent verification and six scripted failure probes. State the remaining Docker/kernel trust. |
+| 8. Validation on the final source | 6:20-7:25 | Distinguish 150 regressions, 12 real-container isolation checks, nine gates and 474 stress expectations: 80 feasible plans and 394 correctly rejected choices. |
+| 9. What the organizer model actually achieved | 7:25-8:40 | Report four genuine gpt-6-luna runs, three successes and one observation planning failure. Do not generalize a success rate from four attempts. |
+| 10. Demo: EPS eclipse recovery | 8:40-10:00 | Show Run A final mission checks, or clearly label the saved trajectory if using it. State scientific and validation limits. Finish within ten minutes. |
 
 The live PS slot has presentations and runs in parallel. Begin the talk while the run executes. Keep the demo configuration ready and preserve the allotted question time.
 
@@ -73,7 +73,7 @@ Use the final validation record for exact test totals, seeds, run IDs, durations
 
 **What remains weak?** Finite adversarial coverage, simplified dynamics and unproven performance with an undisclosed model. The task mix still includes guided repairs. Neither test success nor a presentation rating guarantees a judge's score.
 
-**Is the submission fully compliant?** Public visibility is an explicit user decision and conflicts with the PS private-repository instruction. Registered `ASTRO` versus repository `astro`, organizer access, form upload, deadline and team eligibility remain unresolved administrative checks. Technical evidence cannot substitute for them.
+**Is the submission fully compliant?** Public visibility is an explicit user decision and conflicts with the PS private-repository instruction. Repository and archive both use exact name ASTRO. Organizer invitations await acceptance. The user will submit the official form before 25 October 2026, 10:15 AM IST. Team eligibility remains a human attestation. Technical evidence cannot substitute for them.
 
 ## Current-source live examples
 
