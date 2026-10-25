@@ -1,4 +1,4 @@
-"""Compatibility entry point; builds one validated Astro submission."""
+"""Compatibility entry point; builds one validated ASTRO submission."""
 from package_submission import main
 
 if __name__ == "__main__":

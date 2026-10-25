@@ -1,4 +1,4 @@
-# Team Astro rehearsal pack
+# Team ASTRO rehearsal pack
 
 This is a practice exercise and answer key, not evidence that the team has rehearsed or mastered the project. Use the ten-slide `submission_bundle/deck.pdf` and its editable speaker notes. The measured examples below come from the four genuine organizer-model runs in `submission_bundle/validation-evidence.json`, on the runtime validated at commit `eb49105`. Check matching source/build hashes if the runtime changes.
 

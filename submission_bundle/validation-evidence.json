@@ -6400,7 +6400,7 @@
   "provenance_scope": "Contract v3 binds current harness/sandbox source plus expected Dockerfiles, Compose, .dockerignore and dependency build inputs, normalized across LF/CRLF and baked into the harness. It is not attestation of the active Docker daemon, effective mounts or network configuration.",
   "historical_evidence": "Prior source versions, including earlier eight-task runs and provider outcomes, remain historical. No older success or test result has been relabeled as current nine-task evidence.",
   "clock_limit": "Elapsed values are recorded by the harness/test monotonic clocks. Host/VM pauses have caused large UTC timestamp gaps; these measurements are not independent external wall-clock certification.",
-  "administrative_status": "Public repository at explicit user request conflicts with PS private visibility. Astro/astro capitalization acceptance, organizer access, form upload, deadline and team eligibility remain unconfirmed.",
+  "administrative_status": "Repository and ZIP use exact team name ASTRO. Public visibility remains user requested and conflicts with the PS private-repository rule. Write-access invitations to ayushmothiya1 and rahulgpw are sent and pending acceptance. Organizer deadline: 2026-10-25 10:15 IST. The user will submit the official form personally; form submission and team eligibility are not attested.",
   "supplemental_validation": {
     "runb-contract.json": {
       "created_utc": "2026-10-24T22:38:17+00:00",

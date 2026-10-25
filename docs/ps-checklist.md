@@ -33,11 +33,11 @@ This checklist follows the supplied RL hackathon problem statement. Implemented 
 | Source and build provenance | v3 covers harness/sandbox source and expected Dockerfiles, Compose, `.dockerignore` and dependencies; LF/CRLF-normalized host/baked hashes. This is not attestation of active daemon configuration |
 | Design 1-2 pages; deck PDF | Final documents must match nine-task code and measured evidence; check page count, text bounds and visual layout |
 | No credentials in Git, logs or archive | Ignored local `.env`, blank example, credential scans and archive checksums |
-| Main is the judge branch | `main` is the intended/default judge branch; verify actual checkout and `devesh3001/astro` remote before final upload |
+| Main is the judge branch | `main` is the intended/default judge branch; verify actual checkout and `devesh3001/ASTRO` remote before final upload |
 | Private repository | **Unmet by explicit user choice:** repository remains public |
-| Repository and archive exactly match team name | **Review:** registered `Astro`, repository `astro`, archive `Astro.zip`; confirm case-only difference is accepted |
-| Organizer invited before deadline | **Unconfirmed:** organizer GitHub username has not been supplied |
-| Form upload and deadline | **Unconfirmed:** submission-form email/link and precise deadline have not been supplied; no upload has been performed |
+| Repository and archive exactly match team name | **Pass:** registered `ASTRO`, repository `ASTRO`, archive `ASTRO.zip` |
+| Organizer invited before deadline | **Invitations sent, acceptance pending:** `ayushmothiya1` and `rahulgpw`, with explicitly approved write access |
+| Form upload and deadline | **Deadline confirmed:** 25 October 2026, 10:15 AM IST. [Official form](https://forms.gle/uddpuA4yLu5SZ2wW9). The team will submit itself; no upload performed here |
 | Code timing, originality and team understanding | Team attestation required; commit times alone cannot establish eligibility or authorship |
 
 Run the complete local regression command, build and current-source evidence workflow before packaging:
@@ -50,7 +50,7 @@ python -m unittest tests.test_adversarial tests.test_hardening tests.test_packag
 After genuine evidence and reviewed documents are ready, run the read-only audit:
 
 ```sh
-python scripts/audit_submission.py --team-name Astro --github
+python scripts/audit_submission.py --team-name ASTRO --github
 ```
 
 Use the final suite's actual counts rather than a hardcoded earlier total. Synthetic endpoint checks validate local behavior; privileged reference plans validate feasibility. Neither supplies one of the three genuine model runs. The audit deliberately reports `NOT_COMPLETE` while technical evidence or administrative requirements remain open. Public visibility is not treated as satisfying the private-repository instruction; the user's explicit preference controls visibility.

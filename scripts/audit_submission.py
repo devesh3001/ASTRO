@@ -19,7 +19,7 @@ from harness.provenance import CONTRACT_VERSION
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--team-name', default='Astro')
+    parser.add_argument('--team-name', default='ASTRO')
     parser.add_argument('--archive', type=Path)
     parser.add_argument('--github', action='store_true')
     parser.add_argument('--organizer', help='Exact GitHub username from submission-form email')
@@ -111,19 +111,19 @@ def main():
         else:
             repo = '/'.join(match.groups())
             try:
-                req = Request('https://api.github.com/repos/'+repo, headers={'User-Agent':'Astro-PS-audit'})
+                req = Request('https://api.github.com/repos/'+repo, headers={'User-Agent':'ASTRO-PS-audit'})
                 with urlopen(req, timeout=20) as response:
                     metadata = json.load(response)
                 add('GitHub default branch', 'pass' if metadata['default_branch']=='main' else 'fail', metadata['default_branch'])
                 head = git('rev-parse', 'HEAD')
-                req = Request(f'https://api.github.com/repos/{repo}/actions/runs?head_sha={head}&per_page=20', headers={'User-Agent':'Astro-PS-audit'})
+                req = Request(f'https://api.github.com/repos/{repo}/actions/runs?head_sha={head}&per_page=20', headers={'User-Agent':'ASTRO-PS-audit'})
                 with urlopen(req, timeout=20) as response:
                     workflows = json.load(response)['workflow_runs']
                 current = next((r for r in workflows if r['name']=='AeroSentinel CI' and r['head_sha']==head and r['head_branch']=='main'), None)
                 ci_evidence = {'commit':head, 'workflow':current['html_url'] if current else None,
                                'conclusion':current['conclusion'] if current else 'not found'}
                 if current and current['conclusion']=='success':
-                    req = Request(current['jobs_url'], headers={'User-Agent':'Astro-PS-audit'})
+                    req = Request(current['jobs_url'], headers={'User-Agent':'ASTRO-PS-audit'})
                     with urlopen(req, timeout=20) as response:
                         jobs = json.load(response)['jobs']
                     ci_verified = any(any(step['name']=='Measure isolated cold build' and step['conclusion']=='success'
@@ -137,7 +137,7 @@ def main():
             except Exception as exc:
                 add('GitHub metadata', 'review', type(exc).__name__, True)
     add('Organizer collaborator access', 'review', 'Username supplied but access not yet independently confirmed' if args.organizer else 'Organizer GitHub username not supplied', True)
-    add('Submission form, deadline and upload', 'review', 'Submission email/form and deadline confirmation required; no upload performed', True)
+    add('Submission form, deadline and upload', 'review', 'Official form supplied; deadline 2026-10-25 10:15 IST. The user will submit personally; no upload performed', True)
     add('Hackathon timing and authorship', 'review', 'Team must attest eligibility and understand the implementation; commit times alone do not prove authorship', True)
     try:
         record = json.loads((ROOT/'submission_bundle/validation-evidence.json').read_text(encoding='utf-8'))

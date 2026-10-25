@@ -1,4 +1,4 @@
-# Team Astro: ten-minute presentation and defense
+# Team ASTRO: ten-minute presentation and defense
 
 Use `submission_bundle/deck.pdf` for the required PDF presentation. Use the editable deck's speaker notes for pacing and this guide for rehearsal. Every measured result belongs to the source and runtime-contract hashes in its validation record. After a runtime change, earlier successful logs remain historical. Report current-source evidence explicitly, including missing or failed evidence.
 
@@ -73,7 +73,7 @@ Use the final validation record for exact test totals, seeds, run IDs, durations
 
 **What remains weak?** Finite adversarial coverage, simplified dynamics and unproven performance with an undisclosed model. The task mix still includes guided repairs. Neither test success nor a presentation rating guarantees a judge's score.
 
-**Is the submission fully compliant?** Public visibility is an explicit user decision and conflicts with the PS private-repository instruction. Registered `Astro` versus repository `astro`, organizer access, form upload, deadline and team eligibility remain unresolved administrative checks. Technical evidence cannot substitute for them.
+**Is the submission fully compliant?** Public visibility is an explicit user decision and conflicts with the PS private-repository instruction. Registered `ASTRO` versus repository `astro`, organizer access, form upload, deadline and team eligibility remain unresolved administrative checks. Technical evidence cannot substitute for them.
 
 ## Current-source live examples
 

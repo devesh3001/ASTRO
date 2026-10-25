@@ -152,8 +152,8 @@ def validate_supplemental_report(path):
 
 def validate_documents(team):
     """Package the reviewed tracked PDFs without overwriting them with stale templates."""
-    if team != 'Astro':
-        raise ValueError('Reviewed documents identify Team Astro; update them before packaging another team.')
+    if team != 'ASTRO':
+        raise ValueError('Reviewed documents identify Team ASTRO; update them before packaging another team.')
     for name in ('design-doc.pdf','deck.pdf'):
         path = ROOT / 'submission_bundle' / name
         if not path.is_file() or not path.read_bytes().startswith(b'%PDF-'):
@@ -254,7 +254,7 @@ def assemble(team, logs, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--team-name", default="Astro")
+    parser.add_argument("--team-name", default="ASTRO")
     parser.add_argument("--logs", type=Path, default=ROOT / "logs")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--docs-only", action="store_true")
