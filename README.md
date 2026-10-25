@@ -120,7 +120,7 @@ The first five tasks are guided recovery exercises. The four hard tasks test rad
 
 Each run writes `gate.json`, JSONL records, a unique run identifier and a source fingerprint manifest under `logs/`. Model runs also write a summary and episode termination, verifier reasons and diagnostics. Credentials are never part of the manifest. Contract v3 records the harness hash, running sandbox source hash and `runtime_contract_sha256`. The latter covers both Dockerfiles, Compose, `.dockerignore` and dependency files, using normalized line endings and copies baked into the harness image. It identifies the expected build contract; it does not attest the active Docker daemon, effective mounts or network policy.
 
-The registered team name is **ASTRO**. The reviewed two-page design document and deck with 13 talk slides and three reference slides are tracked in `submission_bundle/`. Validate those PDFs and build the reference archive with:
+The registered team name is **ASTRO**. The reviewed two-page design document and deck with 13 talk slides and five reference slides are tracked in `submission_bundle/`. Validate those PDFs and build the reference archive with:
 
 ```sh
 python scripts/build_submission_docs.py --team-name ASTRO

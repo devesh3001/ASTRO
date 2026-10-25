@@ -1,6 +1,6 @@
 # Team ASTRO rehearsal pack
 
-This is a practice exercise and answer key, not evidence that the team has rehearsed or mastered the project. Use the 16-slide `submission_bundle/deck.pdf` and its editable speaker notes. The measured examples below come from the four genuine organizer-model runs in `submission_bundle/validation-evidence.json`, on the runtime validated at commit `eb49105`. Check matching source/build hashes if the runtime changes.
+This is a practice exercise and answer key, not evidence that the team has rehearsed or mastered the project. Use the 18-slide `submission_bundle/deck.pdf` and its editable speaker notes. The measured examples below come from the four genuine organizer-model runs in `submission_bundle/validation-evidence.json`, on the runtime validated at commit `eb49105`. Check matching source/build hashes if the runtime changes.
 
 ## Ten-minute run-through
 
@@ -119,7 +119,7 @@ A useful self-assessed practice target is **14/16 with no zero in the first six 
 
 # ASTRO presenter script
 
-Present slides 1-13 in ten minutes. Slides 14-16 are reference material for Q&A and reproduction. These are suggested spoken words, not a claim that a human has rehearsed.
+Present slides 1-13 in ten minutes. Slides 14-18 are reference material for Q&A and reproduction. These are suggested spoken words, not a claim that a human has rehearsed.
 
 ## Slide 1: AeroSentinel
 

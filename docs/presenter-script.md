@@ -1,6 +1,6 @@
 # ASTRO presenter script
 
-Present slides 1-13 in ten minutes. Slides 14-16 are reference material for Q&A and reproduction. These are suggested spoken words, not a claim that a human has rehearsed.
+Present slides 1-13 in ten minutes. Slides 14-18 are reference material for Q&A and reproduction. These are suggested spoken words, not a claim that a human has rehearsed.
 
 ## Slide 1: AeroSentinel
 
