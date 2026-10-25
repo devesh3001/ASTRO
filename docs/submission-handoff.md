@@ -42,7 +42,7 @@ Before uploading, a human should check:
 
 - The selected archive is the latest reviewed **`ASTRO.zip`**, rather than a historical backup with the same visible filename.
 - The archive checksum manifest and validation record agree with current source/build fingerprints; all included files verify.
-- The design PDF has one or two pages and the deck is the current ten-slide version.
+- The design PDF has one or two pages and the deck is the current 16-page version (13 talk slides and three reference slides).
 - The evidence includes all-task gates, at least three genuine complete model runs, and honestly labeled success/failure samples. Zero-reply transport attempts are diagnostic only.
 - The actual four current organizer-model runs show EPS, RF and science success plus observation failure. Scripts and local fake-endpoint tests are not additional real model runs.
 - The Run A configuration names EPS recovery, seed 0, empty `APPEND_FILE`, and no compatibility `inputs/append.txt` file. The tracked `append.example.txt` is a sample, not the undisclosed judge file.

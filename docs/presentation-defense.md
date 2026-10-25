@@ -4,18 +4,21 @@ Use `submission_bundle/deck.pdf` for the required PDF presentation. Use the edit
 
 ## Talk sequence
 
-| Slide and actual title | Stopwatch | What to explain |
+| Slide | Time | Opening explanation |
 |---|---:|---|
-| 1. AeroSentinel | 0:00-0:35 | Introduce an evaluation environment for satellite recovery and planning. Judges supply the agent; no policy is trained. |
-| 2. The problem: a repair can arrive too late | 0:35-1:20 | Explain why time, energy and storage make the order of decisions matter. |
-| 3. How an episode works | 1:20-2:15 | Explain observation, tools and protected evaluation. Distinguish simulated mission time from the execution budget. |
-| 4. Nine tasks, with increasing planning depth | 2:15-3:05 | Identify the five guided repairs and four harder planning missions, with seeded faults and three difficulty levels. |
-| 5. The planning test: collect, transmit, repeat | 3:05-4:20 | Trace science seed 101 through two acquisitions and contacts. Explain the finite buffer and constant-duty contradiction. |
-| 6. What earns a successful score | 4:20-5:20 | Explain clamped no-op normalization and mandatory checks. Healthy subsystems cannot compensate for a missed quota. |
-| 7. The agent cannot award itself success | 5:20-6:20 | Explain independent verification and six scripted failure probes. State the remaining Docker/kernel trust. |
-| 8. Validation on the final source | 6:20-7:25 | Distinguish 150 regressions, 12 real-container isolation checks, nine gates and 474 stress expectations: 80 feasible plans and 394 correctly rejected choices. |
-| 9. What the organizer model actually achieved | 7:25-8:40 | Report four genuine gpt-6-luna runs, three successes and one observation planning failure. Do not generalize a success rate from four attempts. |
-| 10. Demo: EPS eclipse recovery | 8:40-10:00 | Show Run A final mission checks, or clearly label the saved trajectory if using it. State scientific and validation limits. Finish within ten minutes. |
+| 1. AeroSentinel | 0:00-0:25 | We are Team ASTRO. |
+| 2. The nine tasks | 0:25-1:05 | These are all nine tasks. |
+| 3. Guided tasks: constraints and difficulty | 1:05-1:40 | For the first five tasks, the challenge is diagnosing and repairing a configuration while meeting every protected condition. |
+| 4. Hard tasks: constraints and planning challenge | 1:40-2:20 | The harder tasks introduce consequences that a final configuration cannot undo. |
+| 5. Architecture and complete run workflow | 2:20-3:10 | One Compose command starts a harness and an isolated sandbox. |
+| 6. What the agent sees and can do | 3:10-3:50 | The observation includes a flight manual, instance-specific mission targets, subsystem configuration and current telemetry. |
+| 7. Worked example: EPS recovery, seed 0 | 3:50-4:30 | Here is the actual unappended demo run. |
+| 8. Worked example: science store and forward | 4:30-5:20 | This is the actual successful science seed one hundred and one run. |
+| 9. Programmatic reward and final verification | 5:20-6:10 | The verifier uses programmatic checks only. |
+| 10. Isolation, errors and attempted shortcuts | 6:10-6:50 | The verifier runs outside the agent workspace. |
+| 11. Reproduce a run from a fresh clone | 6:50-7:45 | A judge can clone main, copy the environment example, select the task and seed, and run this one Compose command. |
+| 12. Measured results and preserved evidence | 7:45-8:40 | The current runtime has one hundred and fifty Linux regression tests, twelve real-container isolation checks and all nine reference/no-op gates passing. |
+| 13. Live Run A, Run B and the judge view | 8:40-10:00 | Run A uses our named EPS demo with seed zero and no append. |
 
 The live PS slot has presentations and runs in parallel. Begin the talk while the run executes. Keep the demo configuration ready and preserve the allotted question time.
 
